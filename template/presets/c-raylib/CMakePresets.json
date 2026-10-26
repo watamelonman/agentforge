@@ -1,0 +1,14 @@
+{
+  "version": 6,
+  "configurePresets": [
+    { "name": "debug", "binaryDir": "build/debug", "generator": "Unix Makefiles",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer" } },
+    { "name": "ci", "inherits": "debug", "binaryDir": "build/ci",
+      "cacheVariables": { "FORGE_HEADLESS_ONLY": "ON" } },
+    { "name": "release", "binaryDir": "build/release", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } }
+  ],
+  "buildPresets": [ { "name": "ci", "configurePreset": "ci", "jobs": 8 },
+                    { "name": "debug", "configurePreset": "debug", "jobs": 8 } ],
+  "testPresets": [ { "name": "ci", "configurePreset": "ci", "output": { "outputOnFailure": true } } ]
+}

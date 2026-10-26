@@ -1,0 +1,5 @@
+# Sample files shipped by this preset. They exist only to prove the gates work on day one.
+# Disposable: `forge init --no-sample` omits them, and the first task card may delete them.
+Game.Core/Rules/Dice.cs
+Game.Core.Tests/DiceTests.cs
+src/game/DiceLabel.cs

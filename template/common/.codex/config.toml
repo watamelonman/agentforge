@@ -1,0 +1,4 @@
+# Project-scoped Codex settings (loaded for trusted projects; see README "Unverified").
+# The orchestrator passes --sandbox explicitly; these are defaults for interactive use.
+sandbox_mode = "workspace-write"
+approval_policy = "never"

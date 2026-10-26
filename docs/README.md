@@ -1,0 +1,18 @@
+# AgentForge documentation
+- [QUICKSTART](../QUICKSTART.md): the 10-minute path
+- [EXAMPLES](EXAMPLES.md): worked examples (new project, `--parallel`/`--wait`, blocked card, stale cooldown, raising a cap)
+- [ARCHITECTURE](ARCHITECTURE.md): components, data flow, runtime files
+- [CLI](CLI.md): every command and option
+- [CONFIG](CONFIG.md): every `forge.toml` key
+- [TASKS](TASKS.md): task cards and JSON schemas
+- [GATES](GATES.md): gates, anti-cheat rules, adding gates
+- [REVIEW_AND_BUDGETS](REVIEW_AND_BUDGETS.md): reviewer, auditor, budgets, logs
+- [CONTEXT_PACK](CONTEXT_PACK.md): what forge puts in each prompt, and token-cost evidence
+- [LIFECYCLE](LIFECYCLE.md): worktrees, merging, scheduling
+- [PRESETS](PRESETS.md): engines and adding new ones
+- [VENDORS](VENDORS.md): claude, codex, glm (Z.ai), grok, OpenCode models, and adding a vendor
+- [LIMITS](LIMITS.md): usage limits, per-vendor cooldowns, allowance windows, `--wait`
+- [INSTALL](INSTALL.md): installer on Arch/Fedora, systemd
+- [TROUBLESHOOTING](TROUBLESHOOTING.md)
+- [GLOSSARY](GLOSSARY.md)
+- [CLI_FLAGS_VERIFIED](CLI_FLAGS_VERIFIED.md): which claude/codex/glm/grok/OpenCode flags forge uses, and their sources

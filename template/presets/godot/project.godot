@@ -1,0 +1,23 @@
+; Engine configuration. Humans edit via the Godot editor; agents may not (scene_globs).
+config_version=5
+
+[application]
+config/name="@NAME@"
+config/features=PackedStringArray("4.5")
+
+[debug]
+; Strict static typing: these warnings are ERRORS (2 = Error). Untyped code fails import/test.
+gdscript/warnings/untyped_declaration=2
+gdscript/warnings/inferred_declaration=0
+gdscript/warnings/unsafe_property_access=2
+gdscript/warnings/unsafe_method_access=2
+gdscript/warnings/unsafe_cast=2
+gdscript/warnings/unsafe_call_argument=2
+gdscript/warnings/unused_variable=2
+gdscript/warnings/unused_parameter=1
+gdscript/warnings/return_value_discarded=0
+gdscript/warnings/integer_division=1
+gdscript/warnings/exclude_addons=true
+
+[editor_plugins]
+enabled=PackedStringArray("res://addons/gdUnit4/plugin.cfg")

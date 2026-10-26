@@ -1,0 +1,77 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "verdict",
+  "summary",
+  "issues",
+  "criteria"
+ ],
+ "properties": {
+  "verdict": {
+   "type": "string",
+   "enum": [
+    "PASS",
+    "FAIL"
+   ]
+  },
+  "summary": {
+   "type": "string"
+  },
+  "issues": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "severity",
+     "file",
+     "problem",
+     "fix"
+    ],
+    "properties": {
+     "severity": {
+      "type": "string",
+      "enum": [
+       "blocker",
+       "major",
+       "nit"
+      ]
+     },
+     "file": {
+      "type": "string"
+     },
+     "problem": {
+      "type": "string"
+     },
+     "fix": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "criteria": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "criterion",
+     "met",
+     "evidence"
+    ],
+    "properties": {
+     "criterion": {
+      "type": "string"
+     },
+     "met": {
+      "type": "boolean"
+     },
+     "evidence": {
+      "type": "string"
+     }
+    }
+   }
+  }
+ }
+}

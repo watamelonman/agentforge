@@ -1,0 +1,13 @@
+# Run forge unattended for one project. Instance = systemd-escaped project path:
+#   systemctl --user start "forge-run@$(systemd-escape -p ~/games/mygame).service"
+#   journalctl --user -fu "forge-run@$(systemd-escape -p ~/games/mygame).service"
+[Unit]
+Description=AgentForge run for %f
+
+[Service]
+Type=simple
+WorkingDirectory=%f
+Environment=PATH=%h/.local/bin:%h/.dotnet:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/forge -C %f run --parallel 2 --audit
+KillMode=control-group
+TimeoutStopSec=60

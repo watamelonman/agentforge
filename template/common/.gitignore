@@ -1,0 +1,11 @@
+.forge/
+build/
+__pycache__/
+*.pyc
+.godot/
+bin/
+obj/
+*.user
+.mono/
+export/
+reports/

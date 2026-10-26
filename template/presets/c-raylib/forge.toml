@@ -1,0 +1,98 @@
+# forge.toml: orchestration + gates. Humans edit this; agents may not (protected).
+[project]
+name = "@NAME@"
+main_branch = "main"
+spec = "spec/SPEC.md"
+strict_milestones = true          # never start milestone N+1 before N is fully merged
+
+[agents]
+workers = ["claude", "codex"]     # round-robin for cards with agent = "any"; vendors: claude | codex | glm | grok
+reviewer = "cross"                # cross = never the author, prefers another CLI | claude | codex | glm | grok | none
+# review_pool = ["codex"]         # optional: vendors cross may pick from (default = workers)
+planner = "claude"
+auditor = "codex"
+swap_on_retry = true              # attempt 3+ rotates to another vendor in workers
+
+[agents.claude]
+bin = "claude"
+model = ""                        # "" = CLI default; e.g. "opus" or "sonnet"
+max_turns = 60
+review_max_turns = 25
+max_budget_usd = 4.0              # per run; only meaningful for API billing
+timeout_min = 40
+extra_args = []
+allow_overage = false             # true = accept paid Claude overage; false stops the run instead
+
+[agents.codex]
+bin = "codex"
+model = ""
+timeout_min = 40                  # codex exec has no max-turns flag; wall clock is the cap
+extra_args = []                   # e.g. ["-c", "model_reasoning_effort=\"high\""]
+
+# GLM (Z.ai) through Claude Code - opt-in. Add "glm" to workers (or review_pool) to use it.
+# Key: ZAI_API_KEY in the env or ~/.config/agentforge/zai.env (chmod 600). Your code is sent
+# to Z.ai (Zhipu, PRC jurisdiction). See docs/VENDORS.md before enabling.
+# [agents.glm]
+# bin = "claude"                    # Claude Code CLI, run with a private Z.ai environment
+# model = "glm-5.3"                 # ANTHROPIC_MODEL + opus/sonnet mapping; "glm-5.3[1m]" = 1M ctx
+# haiku_model = "glm-5.3-flash"     # background/small tasks
+# base_url = "https://api.z.ai/api/anthropic"
+# key_env = "ZAI_API_KEY"
+# key_file = "~/.config/agentforge/zai.env"
+# config_dir = "~/.config/agentforge/glm-claude"   # CLAUDE_CONFIG_DIR, kept apart from ~/.claude
+# max_turns = 60
+# review_max_turns = 25
+# timeout_min = 40
+# extra_args = []
+
+[budget]
+max_attempts = 4                  # worker attempts per task (gate + review loops)
+max_total_usd = 150.0             # stop scheduling when estimated Claude spend reaches this
+max_agent_runs = 400
+max_gate_output_lines = 60        # trimmed gate logs fed back = fewer wasted tokens
+max_review_diff_chars = 60000
+[context]                         # context pack: spec sections/decisions the card cites (docs/CONTEXT_PACK.md)
+enabled = true
+always_spec = []                  # e.g. ["2"]; costs its size on every agent turn
+decision_index = false
+max_chars = 16000
+
+[engine]
+name = "c11-raylib-cmake"
+
+[gates]
+order = ["policy", "layers", "build", "test", "format"]
+timeout_sec = 900
+[gates.cmd]
+build  = "cmake --preset ci >/dev/null && cmake --build --preset ci"
+test   = "ctest --preset ci"
+format = "git ls-files 'src/*.[ch]' 'tests/*.[ch]' | xargs -r clang-format --dry-run -Werror"
+# lint = "run-clang-tidy -p build/ci src"   # enable once clang-tidy is installed
+
+[layers]
+root = "src"
+[layers.allow]
+core = []
+sim = ["core"]
+game = ["sim", "core"]
+platform = ["core"]
+[layers.forbid_headers]
+core = ["raylib.h", "raymath.h", "rlgl.h", "raygui.h"]
+sim  = ["raylib.h", "raymath.h", "rlgl.h", "raygui.h", "time.h"]
+[layers.forbid_patterns]
+sim = ['\brand\(', '\btime\(', 'clock_gettime']
+
+[policy]
+test_globs = ["tests/**"]
+source_globs = ["src/**"]
+scene_globs = []
+protected = ["AGENTS.md", "CLAUDE.md", "forge.toml", "schemas/**", "prompts/**", ".claude/**",
+             ".codex/**", "spec/**", "tasks/**", "CMakePresets.json", ".clang-format", ".clang-tidy"]
+always_allowed = ["docs/**", "CHANGELOG.md", "content/**", "CMakeLists.txt"]
+forbid_added = ['\bTODO\b', '\bFIXME\b', '\bXXX\b', 'UNIMPLEMENTED\(', 'not implemented']
+skip_markers = ['#if 0', 'DISABLED_', 'SKIP\(']
+test_detection = ['getenv\("(TEST|CI|FORGE)', 'FORGE_TEST', '#ifdef\s+TEST']
+assert_regex = '\b(CHECK|CHECK_EQ|assert)\('
+max_file_lines = 600
+max_diff_lines = 1500
+doc_check = true

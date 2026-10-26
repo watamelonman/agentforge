@@ -1,0 +1,12 @@
+<Project Sdk="Godot.NET.Sdk/4.5.0">
+  <!-- Godot game assembly: thin Node scripts in src/game that call Game.Core. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <RootNamespace>Game</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="Game.Core/**;Game.Core.Tests/**" />
+    <ProjectReference Include="Game.Core/Game.Core.csproj" />
+  </ItemGroup>
+</Project>

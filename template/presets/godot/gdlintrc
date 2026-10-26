@@ -1,0 +1,7 @@
+# gdtoolkit (gdlint) config. Defaults are sensible; tighten function length for agents.
+max-line-length: 110
+max-file-lines: 500
+function-arguments-number: 6
+max-public-methods: 25
+max-returns: 6
+disable: []

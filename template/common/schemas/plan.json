@@ -1,0 +1,94 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "tasks",
+  "spec_issues"
+ ],
+ "properties": {
+  "tasks": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "id",
+     "title",
+     "milestone",
+     "deps",
+     "agent",
+     "owns",
+     "docs",
+     "tests_required",
+     "may_edit_tests",
+     "goal",
+     "acceptance",
+     "notes"
+    ],
+    "properties": {
+     "id": {
+      "type": "string"
+     },
+     "title": {
+      "type": "string"
+     },
+     "milestone": {
+      "type": "integer"
+     },
+     "deps": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "agent": {
+      "type": "string",
+      "enum": [
+       "any",
+       "claude",
+       "codex",
+       "glm",
+       "grok"
+      ]
+     },
+     "owns": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "docs": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "tests_required": {
+      "type": "boolean"
+     },
+     "may_edit_tests": {
+      "type": "boolean"
+     },
+     "goal": {
+      "type": "string"
+     },
+     "acceptance": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "notes": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "spec_issues": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  }
+ }
+}

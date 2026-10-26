@@ -1,0 +1,2714 @@
+#!/usr/bin/env python3
+"""forge - orchestrate Claude Code, Codex, GLM (via Claude Code), Grok Build and OpenCode agents on a spec-driven project.
+
+Stdlib only (Python >= 3.11 for tomllib). See README.md.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import concurrent.futures as cf
+import datetime
+import fcntl
+import fnmatch
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+FORGE_HOME = Path(__file__).resolve().parent.parent
+TEMPLATE = FORGE_HOME / "template"
+MOCK_AGENT = FORGE_HOME / "tests" / "mock_agent.py"
+# Built-in vendors. More vendors come from forge.toml: every [agents.<name>] table with
+# harness = "opencode" is one OpenCode-driven model (vendor_names()).
+VENDORS = ("claude", "codex", "glm", "grok")
+# Which CLI ("harness") each built-in vendor runs. glm is Claude Code pointed at Z.ai, so it
+# shares claude's harness (docs/VENDORS.md).
+HARNESS = {"claude": "claude-code", "glm": "claude-code", "codex": "codex", "grok": "grok-build"}
+# Harness types a forge.toml vendor table may declare with `harness = "..."`.
+CUSTOM_HARNESSES = ("opencode",)
+# Model family (lab) per built-in vendor. Cross review prefers a reviewer from another family:
+# two models from one lab share more blind spots than two CLIs running different labs' models.
+FAMILY = {"claude": "anthropic", "codex": "openai", "glm": "zhipu", "grok": "xai"}
+# Family guesses for forge.toml vendors without an explicit `family`, matched in order against
+# the model id after its provider prefix ("opencode-go/kimi-k3" -> "kimi-k3" -> moonshot).
+FAMILY_GUESS = (("claude", "anthropic"), ("haiku", "anthropic"), ("sonnet", "anthropic"),
+                ("opus", "anthropic"), ("gpt", "openai"), ("codex", "openai"), ("glm", "zhipu"),
+                ("kimi", "moonshot"), ("deepseek", "deepseek"), ("qwen", "alibaba"),
+                ("grok", "xai"), ("mimo", "xiaomi"), ("gemini", "google"), ("minimax", "minimax"))
+CLAUDE_CODE_VENDORS = ("claude", "glm")
+ZAI_BASE_URL = "https://api.z.ai/api/anthropic"      # docs.z.ai/devpack/tool/claude
+GLM_DEFAULT_MODEL = "glm-5.3"
+GLM_DEFAULT_HAIKU = "glm-5.3-flash"
+DEFAULT_ZAI_ENV_FILE = "~/.config/agentforge/zai.env"
+DEFAULT_GLM_CONFIG_DIR = "~/.config/agentforge/glm-claude"
+# Credentials/endpoints a parent shell may export that must never leak into a glm run
+# (they would override or conflict with the Z.ai token).
+GLM_STRIP_ENV = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+                 "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_SMALL_FAST_MODEL")
+# grok = xAI's Grok Build CLI (`grok`, AUR grok-build-bin), run headless with -p/--prompt-file.
+GROK_DEFAULT_TOOLS_RO = "read_file,grep,list_dir"   # review/plan/audit: read-only tool allowlist
+# Grok Build errors meaning "out of quota/rate limited, try later". Matched only on a failed run
+# or an error result, like LIMIT_RE.
+GROK_LIMIT_RE = re.compile(r"\b429\b|rate[ _-]?limit|usage limit|quota|too many requests|"
+                           r"out of credits|insufficient credits|limit (?:reached|exceeded)", re.I)
+# Grok Build errors meaning "not logged in / bad key": a setup problem, never the card's fault.
+GROK_AUTH_RE = re.compile(r"not signed in|not authenticated|grok login|invalid api key|"
+                          r"\b401\b|\b403\b|unauthori[sz]ed", re.I)
+# OpenCode (`opencode run`) errors meaning "bad login / key": a setup problem, never the card's fault.
+OPENCODE_AUTH_RE = re.compile(r"\b401\b|\b403\b|unauthori[sz]ed|invalid api key|no credentials|"
+                              r"not logged in|auth login|authentication", re.I)
+# OpenCode/provider account settings that block a model (e.g. OpenCode Go's "This Go model
+# requires Global regions. Select Global in your workspace's Privacy settings"): a setup problem
+# for the user to fix, never the card's fault, so the vendor is disabled like an auth failure.
+OPENCODE_USAGE_RE = re.compile(r"^USAGE\s*\n\s*opencode run", re.M)
+OPENCODE_SETUP_RE = re.compile(r"requires global region|privacy settings", re.I)
+# State dirs OpenCode writes to (auth, sessions, plugin cache); writable inside its bwrap sandbox.
+OPENCODE_RW_DEFAULT = ("~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode",
+                       "~/.config/opencode")
+STATE_LOCK = threading.Lock()
+MERGE_LOCK = threading.Lock()
+STOP = threading.Event()
+
+# Usage limits (docs/LIMITS.md). A limit pauses one vendor, not the run.
+DEFAULT_COOLDOWN_MIN = 60     # when the CLI's message gives no reset time
+MAX_COOLDOWN_DAYS = 8         # parsed reset times further out than this are treated as garbage
+COOL_LOCK = threading.Lock()  # guards COOLDOWNS, DISABLED, SPEND
+COOLDOWNS = {}                # vendor -> {"until": epoch, "why": str}; mirrored in state.json "cooldowns"
+DISABLED = {}                 # vendor -> reason: login/key/config problems, this process only
+SPEND = {}                    # vendor -> [[epoch, usd], ...] for 31 days; mirrored in state.json "spend_log"
+# OpenCode Go splits each model's monthly allowance into windows: at most 20% in any 5 hours,
+# 50% in any 7 days, 100% in 30 days. Used only for vendors with `monthly_usd` set.
+ALLOWANCE_WINDOWS = ((5 * 3600, 0.20), (7 * 86400, 0.50), (30 * 86400, 1.00))
+WAIT = "(wait)"               # pick_reviewer: a reviewer is needed but every candidate is cooling down
+ROUND_LOCK = threading.Lock() # guards pick_worker's round-robin cursor (called from worker threads)
+
+
+# ----------------------------------------------------------------- utilities
+def sh(cmd, cwd=None, check=True, capture=True, timeout=None, env=None):
+    """Run a command (list or shell string) and return CompletedProcess."""
+    r = subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), text=True,
+                       capture_output=capture, timeout=timeout, env=env)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"command failed ({r.returncode}): {cmd}\n{r.stdout}\n{r.stderr}")
+    return r
+
+
+def git(repo, *args, check=True):
+    """Run git -C repo ARGS and return stripped stdout (raises on failure if check)."""
+    return sh(["git", "-C", str(repo), *args], check=check).stdout.strip()
+
+
+def die(msg):
+    """Print an error and exit 1. Used for user errors, never inside worker threads."""
+    print(f"forge: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def now():
+    """Local wall-clock timestamp for logs and history."""
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def tail(text, n):
+    """Keep only the last n lines: gate output fed to agents must stay small (token budget)."""
+    lines = text.splitlines()
+    return "\n".join(lines[-n:]) if len(lines) > n else text
+
+
+def glob_match(path, patterns):
+    """fnmatch where '**' spans directories and 'dir/**' matches everything under dir."""
+    for p in patterns:
+        if fnmatch.fnmatch(path, p) or fnmatch.fnmatch(path, p.replace("**/", "")):
+            return True
+        if p.endswith("/**") and path.startswith(p[:-3] + "/"):
+            return True
+    return False
+
+
+# ------------------------------------------------------------------- project
+class Project:
+    """A forge project: config (forge.toml), paths under .forge/, and thread-safe state."""
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        cfg_path = self.root / "forge.toml"
+        if not cfg_path.exists():
+            die(f"no forge.toml in {self.root} (run `forge init` first or use -C)")
+        self.cfg = tomllib.loads(cfg_path.read_text())
+        self.dir = self.root / ".forge"
+        self.logs = self.dir / "logs"
+        self.wts = self.dir / "worktrees"
+        for d in (self.logs, self.wts):
+            d.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.dir / "state.json"
+        self.main = self.cfg.get("project", {}).get("main_branch", "main")
+        self.mock = os.environ.get("FORGE_MOCK") == "1"
+
+    # config helpers
+    def c(self, *keys, default=None):
+        """Nested config lookup: c('agents','claude','model', default=...)."""
+        node = self.cfg
+        for k in keys:
+            if not isinstance(node, dict) or k not in node:
+                return default
+            node = node[k]
+        return node
+
+    # state
+    def load_state(self):
+        """Read .forge/state.json (or a fresh state)."""
+        if self.state_path.exists():
+            return json.loads(self.state_path.read_text())
+        return {"tasks": {}, "total_usd": 0.0, "agent_runs": 0}
+
+    def update_state(self, fn):
+        """Read-modify-write state under STATE_LOCK with an atomic rename (crash-safe)."""
+        with STATE_LOCK:
+            st = self.load_state()
+            fn(st)
+            tmp = self.state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(st, indent=2))
+            tmp.replace(self.state_path)
+            return st
+
+    def task_state(self, tid):
+        """State dict for one task (status todo / 0 attempts if never seen)."""
+        return self.load_state()["tasks"].get(tid, {"status": "todo", "attempts": 0})
+
+    def set_task(self, tid, **kw):
+        """Update task fields; `event=` dict is appended to its history with a timestamp."""
+        def f(st):
+            t = st["tasks"].setdefault(tid, {"status": "todo", "attempts": 0, "history": []})
+            hist = kw.pop("event", None)
+            t.update(kw)
+            if hist:
+                t.setdefault("history", []).append({"t": now(), **hist})
+        self.update_state(f)
+
+    def event(self, msg):
+        """Print and append one line to .forge/logs/events.log (the human timeline)."""
+        line = f"[{now()}] {msg}"
+        print(line, flush=True)
+        with open(self.logs / "events.log", "a") as fh:
+            fh.write(line + "\n")
+
+    def prompt(self, name):
+        """Load prompts/<name>.md from the project (projects can customize prompts)."""
+        return (self.root / "prompts" / f"{name}.md").read_text()
+
+
+# ---------------------------------------------------------------- task cards
+CARD_RE = re.compile(r"^\+\+\+\n(.*?)\n\+\+\+\n?(.*)$", re.S)
+
+
+def load_cards(proj):
+    """Parse tasks/*.md (TOML front matter between +++ lines) into dicts keyed by id.
+
+    Files without valid front matter are skipped silently so notes can live in tasks/ too.
+    Defaults applied here are the documented card defaults (docs/TASKS.md)."""
+    cards = {}
+    for p in sorted((proj.root / "tasks").glob("*.md")):
+        m = CARD_RE.match(p.read_text())
+        if not m:
+            continue
+        meta = tomllib.loads(m.group(1))
+        meta.setdefault("deps", [])
+        meta.setdefault("owns", [])
+        meta.setdefault("docs", [])
+        meta.setdefault("agent", "any")
+        meta.setdefault("milestone", 1)
+        meta.setdefault("tests_required", True)
+        meta.setdefault("may_edit_tests", False)
+        meta.setdefault("scene_edits", False)
+        meta["path"] = p
+        meta["body"] = m.group(2)
+        meta["raw"] = p.read_text()
+        cards[meta["id"]] = meta
+    return cards
+
+
+def toml_val(v):
+    """Serialize a scalar/list to TOML (tomllib is read-only; cards need only these types)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_val(x) for x in v) + "]"
+    return json.dumps(str(v))
+
+
+def write_card(proj, t):
+    """Write a planner/auditor task dict as tasks/<id>-<slug>.md; returns the path."""
+    slug = re.sub(r"[^a-z0-9]+", "-", t["title"].lower()).strip("-")[:40]
+    keys = ["id", "title", "milestone", "deps", "agent", "owns", "docs",
+            "tests_required", "may_edit_tests", "scene_edits"]
+    meta = "\n".join(f"{k} = {toml_val(t[k])}" for k in keys if k in t)
+    body = f"## Goal\n{t.get('goal', '').strip()}\n\n## Acceptance criteria\n"
+    body += "".join(f"- [ ] {a}\n" for a in t.get("acceptance", []))
+    if t.get("notes"):
+        body += f"\n## Notes\n{t['notes'].strip()}\n"
+    path = proj.root / "tasks" / f"{t['id']}-{slug}.md"
+    path.write_text(f"+++\n{meta}\n+++\n{body}")
+    return path
+
+
+# ------------------------------------------------------------ vendor registry
+def agent_cfg(proj, vendor):
+    """The [agents.<vendor>] table ({} when absent)."""
+    return proj.c("agents", vendor, default={}) or {}
+
+
+def vendor_names(proj):
+    """All vendors this project can use: the built-ins plus every [agents.<name>] table that
+    declares a custom harness (today only harness = "opencode"), in forge.toml order."""
+    agents = proj.c("agents", default={}) or {}
+    extra = [k for k, v in agents.items()
+             if isinstance(v, dict) and k not in VENDORS and v.get("harness") in CUSTOM_HARNESSES]
+    return list(VENDORS) + extra
+
+
+def harness_of(proj, vendor):
+    """CLI a vendor runs: fixed for built-ins, `harness` from its table otherwise (None if unknown)."""
+    return HARNESS.get(vendor) or agent_cfg(proj, vendor).get("harness")
+
+
+def family_of(proj, vendor):
+    """Model family (lab) of a vendor: explicit `family` key, else the built-in table, else a
+    guess from the model id (FAMILY_GUESS), else the vendor's own name (a family of one)."""
+    a = agent_cfg(proj, vendor)
+    if a.get("family"):
+        return a["family"]
+    if vendor in FAMILY:
+        return FAMILY[vendor]
+    model = str(a.get("model") or "").lower().split("/")[-1]
+    for needle, fam in FAMILY_GUESS:
+        if needle in model:
+            return fam
+    return vendor
+
+
+def check_vendor(proj, vendor):
+    """Exit with a clear message when a --agent value is not a vendor of this project."""
+    if vendor not in vendor_names(proj):
+        die(f"unknown vendor {vendor!r}; this project has: {', '.join(vendor_names(proj))} "
+            f"(add an [agents.<name>] table with harness = \"opencode\" for more)")
+    return vendor
+
+
+# ------------------------------------------------------------- usage limits
+# A usage limit pauses one vendor until its reset time; the run carries on with the others.
+# Cooldowns live in memory (COOLDOWNS) for speed and in state.json so the next `forge run`
+# knows them too. Login/key problems disable a vendor for the rest of this process only,
+# because they end when you fix them, not at a reset time. See docs/LIMITS.md.
+def fmt_time(epoch):
+    """Local HH:MM (with the date when it isn't today) for log lines."""
+    t = time.localtime(epoch)
+    return time.strftime("%H:%M" if t[:3] == time.localtime()[:3] else "%Y-%m-%d %H:%M", t)
+
+
+def load_limits(proj):
+    """Load persisted cooldowns and the spend log from state.json (start of a run)."""
+    st = proj.load_state()
+    with COOL_LOCK:
+        COOLDOWNS.clear()
+        COOLDOWNS.update({v: c for v, c in (st.get("cooldowns") or {}).items()
+                          if float(c.get("until", 0)) > time.time()})
+        SPEND.clear()
+        SPEND.update(st.get("spend_log") or {})
+
+
+def default_cooldown_min(proj, vendor):
+    """Cooldown when the limit message names no reset time: per vendor, else [budget], else 60."""
+    v = agent_cfg(proj, vendor).get("cooldown_min")
+    return float(v if v is not None else proj.c("budget", "limit_cooldown_min", default=DEFAULT_COOLDOWN_MIN))
+
+
+def set_cooldown(proj, vendor, until, why):
+    """Pause `vendor` until epoch `until` (in memory and in state.json) and log it."""
+    entry = {"until": until, "why": why, "set": now()}
+    with COOL_LOCK:
+        COOLDOWNS[vendor] = entry
+    proj.update_state(lambda s: s.setdefault("cooldowns", {}).__setitem__(vendor, entry))
+    proj.event(f"{vendor}: cooling down until {fmt_time(until)} ({why}); other vendors keep working")
+
+
+def disable_vendor(proj, vendor, why):
+    """Take `vendor` out of this process (bad key, not logged in, missing sandbox, ...)."""
+    with COOL_LOCK:
+        DISABLED[vendor] = why
+    proj.event(f"{vendor}: SETUP PROBLEM ({why}) - not used again in this run; fix it, then rerun")
+
+
+def allowance_until(proj, vendor, at=None):
+    """For a vendor with `monthly_usd`, the epoch when its recorded spend is back under every
+    allowance window (ALLOWANCE_WINDOWS x allowance_margin); 0 when it is under them now.
+    Caller holds COOL_LOCK. Spend is the CLI's own cost report per run."""
+    a = agent_cfg(proj, vendor)
+    cap = float(a.get("monthly_usd") or 0)
+    if cap <= 0:
+        return 0
+    margin = float(a.get("allowance_margin", 0.9))
+    at = at or time.time()
+    until = 0
+    for span, share in ALLOWANCE_WINDOWS:
+        limit = cap * share * margin
+        inside = sorted((t, c) for t, c in SPEND.get(vendor, []) if t > at - span)
+        total = sum(c for _, c in inside)
+        for t, c in inside:          # the window frees up as its oldest runs age out
+            if total < limit:
+                break
+            total -= c
+            until = max(until, t + span)
+    return until
+
+
+def allowance_use(proj, vendor):
+    """[(window label, spent usd, window limit usd)] for `forge limits`; [] without monthly_usd."""
+    a = agent_cfg(proj, vendor)
+    cap = float(a.get("monthly_usd") or 0)
+    if cap <= 0:
+        return []
+    out = []
+    with COOL_LOCK:
+        for (span, share), label in zip(ALLOWANCE_WINDOWS, ("5h", "7d", "30d")):
+            spent = sum(c for t, c in SPEND.get(vendor, []) if t > time.time() - span)
+            out.append((label, spent, cap * share))
+    return out
+
+
+def cooldown_until(proj, vendor):
+    """Epoch until which `vendor` must not start (hard limit or allowance window); 0 = free now."""
+    with COOL_LOCK:
+        c = COOLDOWNS.get(vendor)
+        hard = float(c["until"]) if c else 0
+        soft = allowance_until(proj, vendor)
+    t = max(hard, soft, pool_until(proj, vendor))
+    return t if t > time.time() else 0
+
+
+def available(proj, vendor):
+    """True when `vendor` may start a run now: not disabled and not cooling down."""
+    with COOL_LOCK:
+        if vendor in DISABLED:
+            return False
+    return cooldown_until(proj, vendor) == 0
+
+
+# ------------------------------------------------------------- shared pools
+# A pool is one paid plan shared by several vendors and by every forge project on this machine
+# (OpenCode Go: one plan-wide allowance for all its models). Spend and plan-level cooldowns go
+# into one append-only JSONL ledger per pool under POOL_DIR, guarded by flock, so a run in one
+# repo sees what runs in the others spent. Per-vendor monthly_usd still applies on top.
+POOL_DIR = Path(os.environ.get("FORGE_POOL_DIR") or
+                Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+                / "agentforge" / "pools")
+POOL_WINDOWS = (("usd_5h", "5h", 5 * 3600), ("usd_7d", "7d", 7 * 86400), ("usd_30d", "30d", 30 * 86400))
+# Provider wording for "the whole plan is out" (not just this model). OpenCode Go 2026-10-21:
+# "Go usage limit exceeded". Override per pool with pools.<name>.plan_limit_re.
+POOL_LIMIT_RE = r"\bGo usage limit\b|plan[- ]wide (?:usage )?limit"
+# A 429 / rate limit from any pooled vendor also cools the whole pool: on a shared plan one
+# model's 429 usually means the account is throttled, and retrying siblings just burns allowance.
+POOL_RATE_RE = re.compile(r"\b429\b|rate[- ]limit|too many requests|usage/rate limit", re.I)
+POOL_CACHE = {}   # pool -> ((mtime_ns, size), entries); the ledger only grows, so size changes
+
+
+def pool_of(proj, vendor):
+    """Name of the shared pool `vendor` draws from ([agents.<vendor>] pool), else None."""
+    p = agent_cfg(proj, vendor).get("pool")
+    return str(p) if p else None
+
+
+def pool_path(pool):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", pool):
+        die(f"bad pool name {pool!r} (letters, digits, . _ - only)")
+    return POOL_DIR / f"{pool}.jsonl"
+
+
+def pool_append(pool, entry):
+    """Append one ledger entry under an exclusive flock (safe across processes and repos)."""
+    path = pool_path(pool)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(dict(entry, t=round(float(entry.get("t") or time.time()), 3)), sort_keys=True) + "\n"
+    with open(path, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            fh.write(line)
+            fh.flush()
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def pool_entries(pool):
+    """All ledger entries (dicts with a numeric "t"); torn or foreign lines are skipped."""
+    path = pool_path(pool)
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return []
+    key = (st.st_mtime_ns, st.st_size)
+    hit = POOL_CACHE.get(pool)
+    if hit and hit[0] == key:
+        return hit[1]
+    with open(path) as fh:
+        fcntl.flock(fh, fcntl.LOCK_SH)
+        try:
+            text = fh.read()
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    out = []
+    for line in text.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and isinstance(e.get("t"), (int, float)):
+            out.append(e)
+    POOL_CACHE[pool] = (key, out)
+    return out
+
+
+def pool_caps(proj, pool):
+    """[(key, label, span secs, cap usd)] from [pools.<pool>]; a cap of 0/unset is off."""
+    cfg = proj.c("pools", pool, default={}) or {}
+    return [(k, lbl, span, float(cfg.get(k) or 0)) for k, lbl, span in POOL_WINDOWS]
+
+
+def pool_spend(pool):
+    return sorted((float(e["t"]), float(e.get("usd") or 0)) for e in pool_entries(pool)
+                  if e.get("kind") == "spend")
+
+
+def pool_until(proj, vendor, at=None):
+    """Epoch until which `vendor`'s pool blocks it (plan-level cooldown from any project, or a
+    pools.<name>.usd_* window at its cap); 0 when free or not pooled."""
+    pool = pool_of(proj, vendor)
+    if not pool:
+        return 0
+    at = at or time.time()
+    entries = pool_entries(pool)
+    cleared = max((e["t"] for e in entries if e.get("kind") == "clear"), default=0)
+    until = max((float(e.get("until") or 0) for e in entries
+                 if e.get("kind") == "cooldown" and e["t"] > cleared), default=0)
+    spend = pool_spend(pool)
+    for _k, _lbl, span, cap in pool_caps(proj, pool):
+        if cap <= 0:
+            continue
+        inside = [(t, c) for t, c in spend if t > at - span]
+        total = sum(c for _, c in inside)
+        for t, c in inside:          # the window frees up as its oldest runs age out
+            if total < cap:
+                break
+            total -= c
+            until = max(until, t + span)
+    return until if until > at else 0
+
+
+def pool_use(proj, pool):
+    """[(label, spent usd, cap usd)] for `forge limits`."""
+    spend, now_ = pool_spend(pool), time.time()
+    return [(lbl, sum(c for t, c in spend if t > now_ - span), cap)
+            for _k, lbl, span, cap in pool_caps(proj, pool) if cap > 0]
+
+
+def record_pool_spend(proj, vendor, cost):
+    """Add one run's reported cost to the vendor's pool ledger (no-op when not pooled)."""
+    pool = pool_of(proj, vendor)
+    if pool and cost > 0:
+        pool_append(pool, {"kind": "spend", "usd": round(cost, 6), "vendor": vendor,
+                           "project": str(proj.root)})
+
+
+def is_plan_limit(proj, vendor, text):
+    """True when a limit message means the whole pool's plan is out."""
+    pool = pool_of(proj, vendor)
+    if not pool:
+        return False
+    pat = proj.c("pools", pool, "plan_limit_re", default=None) or POOL_LIMIT_RE
+    return bool(re.search(pat, text or "", re.I))
+
+
+def pool_wide_limit(proj, vendor, why, raw=""):
+    """True when a pooled vendor's limit should pause its whole pool: the plan-level message
+    (plan_limit_re) or any 429 / rate limit."""
+    if not pool_of(proj, vendor):
+        return False
+    return bool(is_plan_limit(proj, vendor, why) or is_plan_limit(proj, vendor, (raw or "")[-8000:])
+                or POOL_RATE_RE.search(why or ""))
+
+
+def set_pool_cooldown(proj, vendor, until, why):
+    """Pause every vendor in `vendor`'s pool, in every project sharing the ledger."""
+    pool = pool_of(proj, vendor)
+    pool_append(pool, {"kind": "cooldown", "until": round(until, 3), "why": why, "vendor": vendor,
+                       "project": str(proj.root)})
+    proj.event(f"pool {pool}: plan-wide limit ({why}); every vendor in the pool pauses until "
+               f"{fmt_time(until)} in every project")
+
+
+def next_wakeup(proj):
+    """Earliest future epoch at which some cooling vendor becomes free again, else None."""
+    ts = [cooldown_until(proj, v) for v in vendor_names(proj)]
+    ts = [t for t in ts if t]
+    return min(ts) if ts else None
+
+
+# Unit must not run into more letters ("2 hours", "1h30m"); digits may follow ("1h30m").
+DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])", re.I)
+RESET_IN_RE = re.compile(r"(?:try again|retry|resets?|available again)\s+(?:in|after)\s+"
+                         r"((?:\d+(?:\.\d+)?\s*[a-z]+[\s,]*(?:and\s+)?){1,4})", re.I)
+RESET_AT_RE = re.compile(r"(?:resets?|reset at|try again at|available again at)\D{0,20}"
+                         r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))", re.I)
+
+
+def duration_secs(text):
+    """'2 hours 13 minutes' / '1h30m' / '45s' -> seconds (0 if nothing parses)."""
+    unit = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    total = 0.0
+    for n, u in DURATION_RE.findall(text):
+        u = u.lower()
+        key = "m" if u.startswith("min") or u == "m" else u[0]
+        total += float(n) * unit[key]
+    return total
+
+
+def parse_when(value):
+    """Epoch from an epoch number (s or ms) or a timezone-aware ISO time; None otherwise.
+    Times without a zone are ignored on purpose: forge can't know whose clock they mean."""
+    if isinstance(value, (int, float)) and value > 0:
+        return value / 1000 if value > 1e12 else float(value)
+    if isinstance(value, str):
+        try:
+            d = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00").replace(" ", "T"))
+        except ValueError:
+            return None
+        return d.timestamp() if d.tzinfo else None
+    return None
+
+
+def limit_reset_time(raw):
+    """Best guess of when a usage limit lifts (epoch), or None.
+
+    Sources: Claude Code rate_limit_event `resetsAt` (preferring rejected/overage events over
+    plain status events), then "try again in 2h13m" / "resets at <ISO time with zone>" text
+    in the last 4000 chars of the log. Only future times within MAX_COOLDOWN_DAYS count."""
+    strong, weak = [], []
+    for info in rate_limit_events(raw):
+        bucket = strong if info.get("status") == "rejected" or overage_in_use(info) else weak
+        for k in ("resetsAt", "resets_at", "resetAt", "reset_at"):
+            t = parse_when(info.get(k))
+            if t:
+                bucket.append(t)
+    tail_ = raw[-4000:]
+    for m in RESET_IN_RE.finditer(tail_):
+        secs = duration_secs(m.group(1))
+        if secs:
+            strong.append(time.time() + secs)
+    for m in RESET_AT_RE.finditer(tail_):
+        t = parse_when(m.group(1))
+        if t:
+            strong.append(t)
+    horizon = time.time() + MAX_COOLDOWN_DAYS * 86400
+    for bucket in (strong, weak):
+        ok = [t for t in bucket if time.time() < t < horizon]
+        if ok:
+            return max(ok)
+    return None
+
+
+def record_spend(vendor, cost, at=None):
+    """Remember one run's reported cost (memory only; run_agent persists it in state.json)."""
+    if cost <= 0:
+        return
+    at = at or time.time()
+    with COOL_LOCK:
+        SPEND[vendor] = [e for e in SPEND.get(vendor, []) if e[0] > at - 31 * 86400] + [[at, round(cost, 6)]]
+
+
+# -------------------------------------------------------------------- agents
+class AgentResult:
+    """Outcome of one agent run: ok (rc==0), final text, parsed JSON data, cost, log path."""
+    def __init__(self, ok, text="", data=None, cost=0.0, log=None, rc=0):
+        self.ok, self.text, self.data, self.cost, self.log, self.rc = ok, text, data, cost, log, rc
+        self.limited = False   # vendor reported a usage/rate limit; the run was not real work
+
+
+# Vendor CLI messages meaning "out of quota, try later". Matched only on a failed run.
+LIMIT_RE = re.compile(r"usage limit|rate limit|hit your limit|quota exceeded|limit reached", re.I)
+# Z.ai business error codes that mean "quota/rate limit, try later" (docs.z.ai/api-reference/api-code):
+# 1113 no balance, 1302 request rate, 1305 overloaded, 1308 usage limit, 1309 plan expired,
+# 1310 weekly/monthly limit, 1313 fair-use throttle, 1316-1321 5-hour/7-day limits.
+ZAI_LIMIT_CODES = ("1113", "1302", "1305", "1308", "1309", "1310", "1313",
+                   "1316", "1317", "1318", "1319", "1320", "1321")
+ZAI_LIMIT_RE = re.compile(r"(?:API Error|HTTP|status)[^0-9\n]{0,12}429\b|[\"']?code[\"']?\s*[:=]\s*[\"']?(?:" + "|".join(ZAI_LIMIT_CODES) + r")\b", re.I)
+
+
+def read_env_file(path):
+    """Parse a KEY=VALUE file (blank lines, # comments, `export ` prefix and quotes allowed)."""
+    out = {}
+    try:
+        lines = Path(path).expanduser().read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip().removeprefix("export ").strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out[k] = v
+    return out
+
+
+def glm_key(a):
+    """Return (key, source) for the Z.ai API key; key is None when not found.
+
+    Order: the process env var named by key_env (default ZAI_API_KEY), then that name in
+    key_file (default ~/.config/agentforge/zai.env). The key is never logged or printed."""
+    name = a.get("key_env", "ZAI_API_KEY")
+    if os.environ.get(name):
+        return os.environ[name], f"env ${name}"
+    f = a.get("key_file", DEFAULT_ZAI_ENV_FILE)
+    v = read_env_file(f).get(name)
+    return (v, f"file {f}") if v else (None, f"not found (${name} unset, none in {f})")
+
+
+def glm_env(a, base):
+    """Environment for one glm run: `base` plus Z.ai overrides. Returns a new dict;
+    os.environ, ~/.claude and the claude vendor's environment are never modified.
+
+    Variable names follow docs.z.ai/devpack/tool/claude: ANTHROPIC_BASE_URL,
+    ANTHROPIC_AUTH_TOKEN, ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL, API_TIMEOUT_MS,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC; plus ANTHROPIC_MODEL (Claude Code's own
+    model-selection variable) and CLAUDE_CONFIG_DIR, a separate config dir so glm sessions
+    never see or touch the claude.ai login/state in ~/.claude."""
+    key, src = glm_key(a)
+    if not key:
+        raise RuntimeError(f"glm: Z.ai API key {src}")
+    env = {k: v for k, v in base.items() if k not in GLM_STRIP_ENV and k != a.get("key_env", "ZAI_API_KEY")}
+    model = a.get("model") or GLM_DEFAULT_MODEL
+    cfg = Path(a.get("config_dir", DEFAULT_GLM_CONFIG_DIR)).expanduser()
+    cfg.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env.update({
+        "ANTHROPIC_BASE_URL": a.get("base_url", ZAI_BASE_URL),
+        "ANTHROPIC_AUTH_TOKEN": key,
+        "ANTHROPIC_MODEL": model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": a.get("opus_model") or model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": a.get("sonnet_model") or model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": a.get("haiku_model") or GLM_DEFAULT_HAIKU,
+        "API_TIMEOUT_MS": str(a.get("api_timeout_ms", 3000000)),
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "CLAUDE_CONFIG_DIR": str(cfg),
+    })
+    return env
+
+
+def redact(text, secret):
+    """Remove a secret from text before it is printed or written anywhere."""
+    return text.replace(secret, "[REDACTED]") if secret else text
+
+
+def rate_limit_events(raw):
+    """Yield rate_limit_info dicts from Claude Code stream-json `rate_limit_event` lines."""
+    for line in raw.splitlines():
+        if '"rate_limit' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "rate_limit_event":
+            yield ev.get("rate_limit_info") or {}
+
+
+def api_retry_stop(raw, min_attempt=3):
+    """Reason to abort a Claude Code run that is stuck retrying a hopeless request, else None.
+
+    Claude Code retries failed API calls itself (stream-json `system`/`api_retry` events, up
+    to 10 times with growing backoff), so a bad key or an exhausted quota can burn minutes
+    before the CLI exits. From the min_attempt-th retry: 401/403 -> "auth", 429 -> "limit"."""
+    for line in reversed(raw.splitlines()[-200:]):
+        if '"api_retry"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("subtype") != "api_retry" or int(ev.get("attempt") or 0) < min_attempt:
+            return None
+        code = ev.get("error_status")
+        if code in (401, 403):
+            return "auth"
+        if code == 429:
+            return "limit"
+        return None
+    return None
+
+
+def overage_in_use(info):
+    """True when a rate_limit_info says the account is drawing paid overage/extra usage."""
+    return bool(info.get("isUsingOverage") or info.get("overageInUse"))
+
+
+AUTH_PREFIX = "auth: "   # detect_limit reasons starting with this are login/key problems, not limits
+
+
+def detect_limit(proj, vendor, raw, rc, result_is_error=False):
+    """Return a short reason string when this run hit a usage limit, else None.
+    Reasons starting with AUTH_PREFIX mean a login/key problem instead (run_agent disables
+    the vendor for this process rather than cooling it down).
+
+    - any vendor, failed run: LIMIT_RE on the last 4000 chars of the log (original behaviour);
+    - claude/glm: a stream-json rate_limit_event with status "rejected";
+    - glm, failed run or is_error result: HTTP 429 or a Z.ai limit code (ZAI_LIMIT_CODES);
+    - claude only: rate_limit_info.isUsingOverage / overageInUse true, unless
+      [agents.claude] allow_overage = true (paid extra usage is refused by default);
+    - opencode vendors: `error` events with statusCode 401/403 (auth) or 429 / limit wording."""
+    if vendor in CLAUDE_CODE_VENDORS:
+        for info in rate_limit_events(raw):
+            if info.get("status") == "rejected":
+                return "rate_limit_event rejected"
+            if vendor == "claude" and overage_in_use(info) and not proj.c("agents", "claude", "allow_overage", default=False):
+                return "paid overage in use (allow_overage = false)"
+    failed = rc != 0 or result_is_error
+    if harness_of(proj, vendor) == "opencode" and not proj.mock:
+        for status, msg in parse_opencode_output(raw)[3]:
+            if status in (401, 403) or OPENCODE_AUTH_RE.search(msg):
+                return (f"{AUTH_PREFIX}OpenCode provider rejected the login/key ({msg[:120]}); "
+                        "run `opencode auth login`, then rerun")
+            if OPENCODE_SETUP_RE.search(msg):
+                return (f"{AUTH_PREFIX}OpenCode account setting blocks this model ({msg[:160]}); "
+                        "fix it in the OpenCode console, then rerun")
+            if status == 429 or GROK_LIMIT_RE.search(msg):
+                return f"OpenCode usage/rate limit ({msg[:120]})"
+        if failed and OPENCODE_USAGE_RE.search(raw[:4000]) and not parse_opencode_output(raw)[0]:
+            # The CLI printed its help/usage text instead of running: forge's argv doesn't match
+            # this OpenCode version. Never the card's fault; don't charge attempts for it.
+            return (f"{AUTH_PREFIX}`opencode run` rejected forge's arguments (printed its usage text); "
+                    "check `opencode run --help` against opencode_cmd in bin/forge")
+    if vendor == "grok" and (failed or result_is_error):
+        tail_ = raw[-4000:]
+        if GROK_AUTH_RE.search(tail_):
+            return f"{AUTH_PREFIX}grok not signed in / key rejected; run `grok login` (or set XAI_API_KEY), then rerun"
+        if GROK_LIMIT_RE.search(tail_):
+            return "Grok usage/rate limit"
+    if vendor == "glm" and failed and ZAI_LIMIT_RE.search(raw[-4000:]):
+        return "Z.ai quota/rate limit (HTTP 429 / code 13xx)"
+    if failed and LIMIT_RE.search(raw[-4000:]):
+        return "usage limit message"
+    return None
+
+
+def build_cmd(proj, vendor, role, prompt, cwd, out_file, schema):
+    """Return argv for a headless agent run. role: work | review | plan | audit."""
+    a = proj.c("agents", vendor, default={})
+    readonly = role != "work"
+    if proj.mock:
+        return [sys.executable, str(MOCK_AGENT), vendor, role, str(out_file)]
+    if vendor in CLAUDE_CODE_VENDORS:
+        # claude and glm share this argv; glm differs only in its environment (glm_env).
+        cmd = [a.get("bin", "claude"), "-p", prompt,
+               "--output-format", "stream-json", "--verbose",
+               "--max-turns", str(a.get("review_max_turns" if readonly else "max_turns", 30 if readonly else 60)),
+               "--no-session-persistence"]
+        if a.get("max_budget_usd") and vendor == "claude":
+            cmd += ["--max-budget-usd", str(a["max_budget_usd"])]
+        if a.get("model") and vendor == "claude":
+            cmd += ["--model", a["model"]]   # glm: model comes from ANTHROPIC_MODEL in glm_env
+        if readonly:
+            # Read-only tool set; structured verdict via JSON schema.
+            cmd += ["--tools", "Read,Grep,Glob"]
+            if schema:
+                cmd += ["--json-schema", Path(schema).read_text()]
+        else:
+            # Edits allowed; Bash limited by .claude/settings.json allow/deny lists.
+            cmd += ["--permission-mode", a.get("permission_mode", "acceptEdits")]
+        return cmd + list(a.get("extra_args", []))
+    if vendor == "codex":
+        cmd = [a.get("bin", "codex"), "exec", "--json", "-C", str(cwd),
+               "--sandbox", "read-only" if readonly else "workspace-write",
+               "-o", str(out_file)]
+        if a.get("model"):
+            cmd += ["-m", a["model"]]
+        if not readonly and proj.c("agents", "codex", "network_access", default=False):
+            # Official config key (codex config reference): outbound network inside the
+            # workspace-write sandbox, e.g. for NuGet restore. Off by default in Codex.
+            cmd += ["-c", "sandbox_workspace_write.network_access=true"]
+        if readonly and schema:
+            cmd += ["--output-schema", str(schema)]
+        cmd = cmd + list(a.get("extra_args", [])) + ["-"]   # prompt on stdin
+        if not readonly and a.get("sandbox") == "bwrap":
+            # Codex's own Linux sandbox (seccomp) kills 32-bit/Win32 shims such as wibo with
+            # SIGSYS. Opt-in: run Codex unsandboxed *inside* forge's bwrap (fs read-only,
+            # worktree + ~/.codex writable, .forge and agentforge keys hidden).
+            i = cmd.index("--sandbox"); cmd[i + 1] = "danger-full-access"
+            a = dict(a); a["extra_rw"] = list(a.get("extra_rw", [])) + ["~/.codex"]
+            cmd = sandbox_wrap(proj, a, cwd, cmd, writable_cwd=True)
+        return cmd
+    if vendor == "grok":
+        return grok_cmd(a, readonly, cwd, out_file, schema)
+    if harness_of(proj, vendor) == "opencode":
+        return opencode_cmd(proj, vendor, a, role, prompt, cwd, out_file)
+    raise ValueError(vendor)
+
+
+# ------------------------------------------------------------------ opencode
+# One [agents.<name>] table with harness = "opencode" = one model driven by `opencode run`
+# (e.g. OpenCode Go's kimi-k3). OpenCode has no OS sandbox of its own and `--auto` approves
+# every tool call that isn't denied, so forge runs it inside bubblewrap by default.
+OPENCODE_ARGV_MAX = 100_000   # bytes; bigger prompts go via --file (Linux caps one argv string at 128 KiB)
+
+
+def opencode_cmd(proj, vendor, a, role, prompt, cwd, out_file):
+    """argv for one headless `opencode run` (docs/VENDORS.md, "OpenCode").
+
+    `--format json` prints one JSON event per line (parse_opencode_output). Workers get
+    `--auto` (approve whatever OPENCODE_PERMISSION doesn't deny); review/plan/audit don't,
+    and their permissions deny edit/bash/webfetch. The prompt is the message argument, or an
+    attached file when it is too long for argv. Wrapped in bwrap unless sandbox = "none"."""
+    model = a.get("model")
+    if not model:
+        raise RuntimeError(f"[agents.{vendor}] needs model = \"provider/model\", e.g. \"opencode-go/kimi-k3\"")
+    # OpenCode 2.x dropped `--dir` and `--variant` (verified on 2.1.2, 2026-10-21): the working
+    # directory comes from Popen(cwd=...) / bwrap --chdir, the variant from `-m provider/model#variant`.
+    if a.get("variant"):
+        model = f"{model}#{a['variant']}"
+    # --standalone: OpenCode 2.x otherwise hands the run to its background service
+    # (`opencode serve --service`), which executes tools OUTSIDE the bwrap sandbox and outside
+    # the worktree. A private server keeps every tool call inside the sandbox, in `cwd`.
+    inner = [a.get("bin", "opencode"), "run", "--standalone", "--format", "json", "-m", model]
+    if role == "work":
+        inner += ["--auto"]
+    inner += list(a.get("extra_args", []))
+    pfile = grok_prompt_file(out_file)   # <log stem>.prompt.md, written by run_agent
+    ro_files = []
+    if len(prompt.encode()) > OPENCODE_ARGV_MAX:
+        inner += ["--file", str(pfile), f"Your complete instructions are in the attached file {pfile.name}. "
+                  "Follow them exactly."]
+        ro_files.append(pfile)
+    else:
+        inner += [prompt]
+    return sandbox_wrap(proj, a, cwd, inner, writable_cwd=(role == "work"), ro_files=ro_files)
+
+
+def sandbox_wrap(proj, a, cwd, inner, writable_cwd, ro_files=()):
+    """Run `inner` inside bubblewrap: the whole filesystem read-only, the worktree writable
+    (workers only), OpenCode's own state dirs writable, and the project's .forge/ (other
+    tasks' worktrees, logs, state.json) plus ~/.config/agentforge (API keys) hidden.
+    Network stays on (the model API needs it). sandbox = "none" returns `inner` unchanged."""
+    if a.get("sandbox", "bwrap") == "none":
+        return inner
+    bw = shutil.which(a.get("bwrap", "bwrap"))
+    if not bw:
+        raise RuntimeError("bubblewrap (bwrap) not found: install it (Arch/Fedora package `bubblewrap`) "
+                           "or set sandbox = \"none\" for this vendor (not recommended)")
+    root = Path(getattr(proj, "root", "."))
+    cmd = [bw, "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+           "--tmpfs", "/tmp"]
+    hide = [root / ".forge", Path("~/.config/agentforge").expanduser()]
+    hide += [Path(h).expanduser() for h in a.get("hide", [])]
+    for h in hide:
+        if h.exists():
+            cmd += ["--tmpfs", str(h)]
+    if (root / ".git").exists():   # worktree git metadata, also when the project lives under /tmp
+        cmd += ["--ro-bind", str(root / ".git"), str(root / ".git")]
+    rw = [Path(p).expanduser() for p in list(OPENCODE_RW_DEFAULT) + list(a.get("extra_rw", []))]
+    for p in rw:
+        p.mkdir(parents=True, exist_ok=True)
+        cmd += ["--bind", str(p), str(p)]
+    cmd += ["--bind" if writable_cwd else "--ro-bind", str(cwd), str(cwd)]
+    for f in ro_files:
+        cmd += ["--ro-bind", str(f), str(f)]
+    return cmd + ["--chdir", str(cwd)] + inner
+
+
+def claude_bash_denies(root):
+    """Bash deny patterns from the project's .claude/settings.json ("Bash(git push*)" -> "git push*"),
+    so OpenCode workers get the same command blocklist as Claude Code workers."""
+    try:
+        cfg = json.loads((Path(root) / ".claude" / "settings.json").read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for rule in cfg.get("permissions", {}).get("deny", []):
+        m = re.fullmatch(r"Bash\((.+)\)", rule)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def opencode_permissions(proj, a, role):
+    """OPENCODE_PERMISSION for one run. Read-only roles: no edits, no shell, no web.
+    Workers: edits allowed, shell allowed except the .claude deny list, web only if web_search.
+    "*" comes first so the specific deny patterns after it win under last-match rules."""
+    web = "allow" if a.get("web_search") else "deny"
+    if role != "work":
+        return {"edit": "deny", "bash": "deny", "webfetch": "deny"}
+    bash = {"*": "allow"}
+    for pat in claude_bash_denies(getattr(proj, "root", ".")):
+        bash[pat] = "deny"
+    return {"edit": "allow", "bash": bash, "webfetch": web}
+
+
+def parse_opencode_output(raw):
+    """(final text, total cost, token totals, errors) from `opencode run --format json`.
+
+    Event lines: {"type": "text"|"tool_use"|"step_start"|"step_finish"|"error", "part"|"error": ...}.
+    The final answer is the text of the last message that produced text. Cost and tokens are
+    summed over step_finish parts. errors = [(statusCode or None, message)]."""
+    texts, order = {}, []
+    cost = 0.0
+    tokens = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}
+    errors = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        kind, part = ev.get("type"), ev.get("part") or {}
+        if kind == "text" and part.get("text"):
+            mid = part.get("messageID") or ""
+            if mid not in texts:
+                texts[mid] = []
+                order.append(mid)
+            texts[mid].append(part["text"])
+        elif kind == "step_finish":
+            cost += float(part.get("cost") or 0)
+            tk = part.get("tokens") or {}
+            cache = tk.get("cache") or {}
+            for k, v in (("input", tk.get("input")), ("output", tk.get("output")),
+                         ("reasoning", tk.get("reasoning")), ("cache_read", cache.get("read")),
+                         ("cache_write", cache.get("write"))):
+                tokens[k] += int(v or 0)
+        elif kind == "error":
+            err = ev.get("error") or {}
+            data = err.get("data") or {}
+            msg = data.get("message") or err.get("message") or err.get("name") or "error"
+            # OpenCode 2.x puts the HTTP status at error.status (1.x: error.data.statusCode).
+            status = data.get("statusCode") or err.get("status") or err.get("statusCode")
+            errors.append((int(status) if str(status).isdigit() else None, str(msg)))
+    text = "\n".join(texts[order[-1]]) if order else ""
+    return text, cost, tokens, errors
+
+
+def grok_prompt_file(out_file):
+    """Prompt file run_agent writes before starting the CLI: <log stem>.prompt.md."""
+    return Path(out_file).with_suffix(".prompt.md")
+
+
+def grok_cmd(a, readonly, cwd, out_file, schema):
+    """argv for one headless Grok Build run (docs: ~/.grok/docs/user-guide/14-headless-mode.md).
+
+    Prompt comes from --prompt-file (the .prompt.md forge already logs), so long prompts never
+    hit argv limits. work: workspace sandbox (writes only inside the worktree) and
+    always-approve, since headless runs cannot answer permission prompts; deny rules from
+    .claude/settings.json still apply. review/plan/audit: read-only sandbox, read-only tool
+    allowlist and, with a schema, --json-schema (which implies --output-format json).
+    Otherwise output is streaming-messages-json so the final `result` line parses like Claude's."""
+    cmd = [a.get("bin", "grok"), "--prompt-file", str(grok_prompt_file(out_file)),
+           "--cwd", str(cwd), "--no-alt-screen",
+           "--max-turns", str(a.get("review_max_turns" if readonly else "max_turns", 30 if readonly else 60))]
+    if a.get("model"):
+        cmd += ["-m", a["model"]]
+    if a.get("reasoning_effort"):
+        cmd += ["--reasoning-effort", str(a["reasoning_effort"])]
+    if readonly:
+        cmd += ["--sandbox", a.get("review_sandbox", "read-only"),
+                "--tools", a.get("review_tools", GROK_DEFAULT_TOOLS_RO), "--disable-web-search",
+                "--no-subagents"]
+        if schema:
+            cmd += ["--json-schema", Path(schema).read_text()]
+        else:
+            cmd += ["--output-format", "streaming-messages-json"]
+    else:
+        cmd += ["--sandbox", a.get("sandbox", "workspace"), "--always-approve",
+                "--output-format", "streaming-messages-json"]
+        if not a.get("web_search", False):
+            cmd += ["--disable-web-search"]
+    return cmd + list(a.get("extra_args", []))
+
+
+def _grok_field(ev, *names):
+    """First present key among snake_case/camelCase aliases Grok logs use interchangeably."""
+    for n in names:
+        if n in ev and ev[n] is not None:
+            return ev[n]
+    return None
+
+
+def _iter_grok_json_events(raw):
+    """Yield dict events from a Grok headless log: single-line NDJSON first, then a trailing
+    pretty-printed object (`--json-schema` / `--output-format json` writes one indented blob)."""
+    for line in reversed((raw or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(ev, dict):
+            yield ev
+    text = raw or ""
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] != "{":
+            continue
+        try:
+            ev = json.loads(text[i:])
+        except Exception:
+            continue
+        if isinstance(ev, dict):
+            yield ev
+        break
+
+
+def parse_grok_output(raw):
+    """(text, structured data or None, cost, is_error) from a Grok Build headless log.
+
+    Handles the streaming-messages-json terminal `result` line, the single `--output-format
+    json` / `--json-schema` object ({"text": ..., "stopReason": ..., "structuredOutput": ...})
+    and `{"type":"error","message":...}`. Field names accept both snake_case and camelCase
+    (`structured_output`/`structuredOutput`, `is_error`/`isError`, `total_cost_usd`/
+    `totalCostUsd`, `stop_reason`/`stopReason`, `session_id`/`sessionId`).
+    total_cost_usd is often absent on subscription (OAuth) traffic; 0.0 then."""
+    for ev in _iter_grok_json_events(raw):
+        cost = float(_grok_field(ev, "total_cost_usd", "totalCostUsd") or 0)
+        if ev.get("type") == "result":
+            data = _grok_field(ev, "structured_output", "structuredOutput")
+            return (ev.get("result") or "", data if isinstance(data, dict) else data,
+                    cost, bool(_grok_field(ev, "is_error", "isError")))
+        if ev.get("type") == "error":
+            return ev.get("message") or "", None, cost, True
+        # json / --json-schema final object (camelCase stopReason/sessionId, or snake aliases)
+        if "text" in ev and (_grok_field(ev, "stopReason", "stop_reason", "sessionId", "session_id")
+                             is not None or "structuredOutput" in ev or "structured_output" in ev):
+            data = _grok_field(ev, "structured_output", "structuredOutput")
+            return ev.get("text") or "", data if isinstance(data, dict) else None, cost, False
+    # Last resort: whole-file JSON (Grok sometimes finishes flushing after process exit)
+    try:
+        ev = json.loads(raw or "")
+    except Exception:
+        ev = None
+    if isinstance(ev, dict):
+        cost = float(_grok_field(ev, "total_cost_usd", "totalCostUsd") or 0)
+        data = _grok_field(ev, "structured_output", "structuredOutput")
+        if isinstance(data, dict) or "text" in ev:
+            return (ev.get("text") or ev.get("result") or ""), data if isinstance(data, dict) else None, cost, bool(_grok_field(ev, "is_error", "isError"))
+    return "", None, 0.0, False
+
+
+def parse_json_blob(text):
+    """Best-effort JSON extraction: whole text, a ```json fence, or the outermost {...}."""
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S) or re.search(r"(\{.*\})", text, re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def run_agent(proj, vendor, role, prompt, cwd, tag, schema=None):
+    """Run one agent headless with timeout, log everything, return AgentResult.
+
+    A usage limit no longer stops the whole run: the vendor is put in a cooldown (until the
+    reset time the CLI reported, else limit_cooldown_min) and res.limited tells the caller to
+    try another vendor. Login/key/sandbox problems disable the vendor for this process."""
+    st = proj.load_state()
+    max_usd = proj.c("budget", "max_total_usd", default=0)
+    if max_usd and vendor == "claude" and st.get("total_usd", 0) >= max_usd:
+        # budget.max_total_usd counts only Claude's spend, so it refuses only Claude: Claude
+        # sits out the rest of this run (no attempt charged; cards fall back to other vendors).
+        why = f"claude budget ${max_usd} exhausted; claude disabled"
+        with COOL_LOCK:
+            first = vendor not in DISABLED
+            DISABLED[vendor] = why
+        if first:
+            proj.event(f"run: {why}")
+        res = AgentResult(False, why)
+        res.limited = True
+        return res
+    max_runs = proj.c("budget", "max_agent_runs", default=0)
+    if max_runs and st.get("agent_runs", 0) >= max_runs:
+        STOP.set()
+        return AgentResult(False, f"global run cap {max_runs} reached")
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    log = proj.logs / f"{tag}-{role}-{vendor}-{ts}.log"
+    out_file = proj.logs / f"{tag}-{role}-{vendor}-{ts}.out"
+    schema_path = proj.root / "schemas" / f"{schema}.json" if schema else None
+    is_oc = harness_of(proj, vendor) == "opencode" and not proj.mock
+    if is_oc and schema_path:
+        # opencode run has no schema flag: put the schema in the prompt; parse_json_blob reads the reply.
+        prompt += ("\n\n## Required JSON schema for your final message\n```json\n"
+                   + schema_path.read_text().strip() + "\n```\nYour final message must be only that JSON object.\n")
+
+    def setup_problem(why):
+        # Not the card's fault: no attempt is charged, the vendor sits out the rest of this run.
+        disable_vendor(proj, vendor, why)
+        res = AgentResult(False, why)
+        res.limited = True
+        return res
+
+    timeout = 60 * proj.c("agents", vendor, "timeout_min", default=45)
+    env = dict(os.environ, FORGE_ROLE=role, FORGE_TASK=tag, FORGE_SCHEMA=str(schema_path or ""))
+    secret = None
+    if vendor == "glm" and not proj.mock:
+        try:
+            env = glm_env(proj.c("agents", "glm", default={}), env)
+        except RuntimeError as e:
+            return setup_problem(f"{e} (see docs/VENDORS.md)")
+        secret = env["ANTHROPIC_AUTH_TOKEN"]
+    if is_oc:
+        env["OPENCODE_PERMISSION"] = json.dumps(opencode_permissions(proj, agent_cfg(proj, vendor), role))
+    (proj.logs / f"{tag}-{role}-{vendor}-{ts}.prompt.md").write_text(prompt)
+    try:
+        cmd = build_cmd(proj, vendor, role, prompt, cwd, out_file, schema_path)
+    except RuntimeError as e:   # missing model / bwrap: configuration, fix and rerun
+        return setup_problem(str(e))
+    proj.event(f"{tag}: {role} -> {vendor} (log {log.name})")
+    t0 = time.time()
+    with open(log, "w") as fh:
+        p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=fh,
+                             stderr=subprocess.STDOUT, text=True, env=env,
+                             start_new_session=True)
+        # claude/glm/opencode get the prompt as argv, grok as --prompt-file; codex/mock read stdin.
+        try:
+            if proj.mock or not (vendor in CLAUDE_CODE_VENDORS or vendor == "grok" or is_oc):
+                p.stdin.write(prompt)
+            p.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        def kill():
+            os.killpg(p.pid, signal.SIGTERM)
+            time.sleep(3)
+            if p.poll() is None:
+                os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+        # Poll instead of communicate() so a claude run that starts drawing paid overage is
+        # stopped within seconds (rate_limit_event arrives early in the stream), not at the end.
+        # Only the bytes added since the last poll are read (long stream-json logs reach many MB).
+        guard = vendor == "claude" and not proj.c("agents", "claude", "allow_overage", default=False)
+        watch = vendor in CLAUDE_CODE_VENDORS and not proj.mock
+        recent = collections.deque(maxlen=200)   # api_retry_stop looks at the newest 200 lines
+        pending = ""
+        deadline = time.time() + timeout
+        retry_stop = None
+        with open(log, errors="replace") as reader:
+            while p.poll() is None:
+                if time.time() > deadline:
+                    kill()
+                    proj.event(f"{tag}: {vendor} TIMEOUT after {timeout}s - killed")
+                    break
+                if watch:
+                    chunk = pending + reader.read()
+                    lines = chunk.split("\n")
+                    pending = lines.pop()          # keep a half-written last line for next time
+                    recent.extend(lines)
+                    if guard and any(overage_in_use(i) for i in rate_limit_events("\n".join(lines))):
+                        kill()
+                        proj.event(f"{tag}: claude switched to paid overage - killed (allow_overage = false)")
+                        break
+                    retry_stop = api_retry_stop("\n".join(recent))
+                    if retry_stop:
+                        kill()
+                        proj.event(f"{tag}: {vendor} API keeps returning "
+                                   f"{'401/403 (bad key/login)' if retry_stop == 'auth' else '429'} - killed")
+                        break
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+    raw = log.read_text(errors="replace")
+    if secret and secret in raw:   # never keep the key on disk, even if a CLI echoed it
+        raw = redact(raw, secret)
+        log.write_text(raw)
+    result_is_error = False
+    text, data, cost, tokens = "", None, 0.0, None
+    if vendor in CLAUDE_CODE_VENDORS and not proj.mock:
+        for line in reversed(raw.splitlines()):
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("type") == "result":
+                text = ev.get("result") or ""
+                data = ev.get("structured_output")
+                cost = float(ev.get("total_cost_usd") or 0)
+                result_is_error = bool(ev.get("is_error"))
+                break
+    elif vendor == "grok" and not proj.mock:
+        # Grok Build can exit before the final pretty JSON lands on disk; retry briefly.
+        text, data, cost, result_is_error = parse_grok_output(raw)
+        for _ in range(6):
+            if data is not None or text or result_is_error:
+                break
+            time.sleep(0.5)
+            raw = log.read_text(errors="replace")
+            text, data, cost, result_is_error = parse_grok_output(raw)
+    elif is_oc:
+        text, cost, tokens, errors = parse_opencode_output(raw)
+        result_is_error = bool(errors)
+        if not text and errors:
+            text = errors[-1][1]
+    else:
+        text = out_file.read_text(errors="replace") if out_file.exists() else ""
+    if data is None and schema:
+        data = parse_json_blob(text)
+    dt = int(time.time() - t0)
+    record_spend(vendor, cost)
+    record_pool_spend(proj, vendor, cost)
+
+    def f(s):
+        # Only real Claude counts toward total_usd (= budget.max_total_usd). glm's cost is
+        # Claude Code's estimate at Anthropic prices, which means nothing on a Z.ai plan; it is
+        # kept separately as glm_usd_nominal. Codex reports no cost; grok's reported cost (often
+        # absent on subscription logins) is kept as grok_usd_reported. OpenCode vendors' cost
+        # (API-price figures, which is what OpenCode Go's allowances are counted in) goes to
+        # vendor_usd. spend_log feeds the monthly_usd allowance windows.
+        if vendor == "claude":
+            s["total_usd"] = s.get("total_usd", 0) + cost
+        elif vendor == "glm":
+            s["glm_usd_nominal"] = s.get("glm_usd_nominal", 0) + cost
+        elif vendor == "grok":   # xAI subscription/API spend; never counted in budget.max_total_usd
+            s["grok_usd_reported"] = s.get("grok_usd_reported", 0) + cost
+        else:
+            vu = s.setdefault("vendor_usd", {})
+            vu[vendor] = round(vu.get(vendor, 0) + cost, 6)
+        if cost > 0:
+            cutoff = time.time() - 31 * 86400
+            sl = s.setdefault("spend_log", {})
+            sl[vendor] = [e for e in sl.get(vendor, []) if e[0] > cutoff] + [[time.time(), round(cost, 6)]]
+        if tokens:
+            vt = s.setdefault("vendor_tokens", {}).setdefault(vendor, {})
+            for k, v in tokens.items():
+                vt[k] = vt.get(k, 0) + v
+        s["agent_runs"] = s.get("agent_runs", 0) + 1
+        runs = s.setdefault("vendor_runs", {})
+        runs[vendor] = runs.get(vendor, 0) + 1
+    proj.update_state(f)
+    proj.event(f"{tag}: {vendor} {role} finished rc={p.returncode} {dt}s ${cost:.2f}"
+               + (" (nominal, not billed by Anthropic)" if vendor == "glm" else ""))
+    res = AgentResult(p.returncode == 0 and not (is_oc and result_is_error), text, data, cost, log, p.returncode)
+    why = detect_limit(proj, vendor, raw, p.returncode, result_is_error)
+    if retry_stop == "limit":
+        why = why or "HTTP 429 on repeated retries"
+    elif retry_stop == "auth":
+        why = f"{AUTH_PREFIX}API authentication failed (HTTP 401/403); fix the key/login, then rerun"
+    if why and why.startswith(AUTH_PREFIX):
+        return setup_problem(why[len(AUTH_PREFIX):])
+    if why:
+        res.limited = True
+        until = limit_reset_time(raw)
+        src = "reported reset" if until else f"no reset time given; {default_cooldown_min(proj, vendor):g} min default"
+        until = (until + 60) if until else time.time() + 60 * default_cooldown_min(proj, vendor)
+        proj.event(f"{tag}: {vendor} USAGE LIMIT hit ({why}) - attempt not charged; "
+                   f"{vendor} pauses until {fmt_time(until)} ({src})")
+        set_cooldown(proj, vendor, until, why)
+        if pool_wide_limit(proj, vendor, why, raw):
+            set_pool_cooldown(proj, vendor, until, why)
+    return res
+
+
+# --------------------------------------------------------------------- gates
+def changed_files(wt, base):
+    """List (status letter, current path, previous path) for merge-base...HEAD; renames tracked."""
+    out = git(wt, "diff", "--name-status", "-M", f"{base}...HEAD")
+    res = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        res.append((parts[0][0], parts[-1], parts[1] if parts[0][0] == "R" else parts[-1]))
+    return res  # (status, path_now, path_before)
+
+
+def added_lines(wt, base, path):
+    """Lines added to path in base...HEAD (zero-context diff, '+' prefix stripped)."""
+    d = git(wt, "diff", "-U0", f"{base}...HEAD", "--", path, check=False)
+    return [l[1:] for l in d.splitlines() if l.startswith("+") and not l.startswith("+++")]
+
+
+def removed_lines(wt, base, path):
+    """Lines removed from path in base...HEAD."""
+    d = git(wt, "diff", "-U0", f"{base}...HEAD", "--", path, check=False)
+    return [l[1:] for l in d.splitlines() if l.startswith("-") and not l.startswith("---")]
+
+
+def sample_paths(wt, base):
+    """Paths listed in .forge-samples as of `base` (the main-branch side of the diff).
+
+    Read from base, never from the worker's tree, so a worker cannot whitelist a test
+    by adding it to the manifest. Missing manifest -> empty set."""
+    r = sh(["git", "-C", str(wt), "show", f"{base}:.forge-samples"], check=False)
+    if r.returncode != 0:
+        return set()
+    return {l.strip() for l in r.stdout.splitlines() if l.strip() and not l.strip().startswith("#")}
+
+
+def gate_policy(proj, wt, base, card):
+    """Anti-cheat + scope + size + docs. Returns list of failure strings."""
+    P = proj.c("policy", default={})
+    tests = P.get("test_globs", ["tests/**"])
+    protected = P.get("protected", [])
+    common = P.get("always_allowed", ["docs/**", "CHANGELOG.md"])
+    src_globs = P.get("source_globs", ["src/**"])
+    forbid = [re.compile(x) for x in P.get("forbid_added", [])]
+    skips = [re.compile(x) for x in P.get("skip_markers", [])]
+    assert_re = re.compile(P.get("assert_regex", r"\bassert|EXPECT_|ASSERT_|CHECK\("))
+    test_detect = [re.compile(x) for x in P.get("test_detection", [])]
+    max_lines = P.get("max_file_lines", 600)
+    max_diff = P.get("max_diff_lines", 1500)
+    scene_globs = P.get("scene_globs", [])
+    max_scene = P.get("max_scene_diff_lines", 40)
+    fails = []
+    files = changed_files(wt, base)
+    if not files:
+        return ["No changes were committed. Implement the task."]
+    total = 0
+    added_test_asserts = removed_test_asserts = 0
+    samples = sample_paths(wt, base)
+    may_edit = bool(card.get("may_edit_tests"))
+    for status, path, before in files:
+        is_test = glob_match(path, tests) or glob_match(before, tests)
+        is_sample = before in samples
+        if ".forge-samples" in (path, before):
+            fails.append("PROTECTED: .forge-samples is human-owned; workers may not change it.")
+        if glob_match(path, protected) or glob_match(before, protected):
+            fails.append(f"PROTECTED: {path} may not be modified by workers (protected path).")
+        # Existing tests: deleting or editing needs may_edit_tests=true on the card. Disposable
+        # sample files (.forge-samples on main) count as permitted too, but only for deletion.
+        if status == "D" and is_test and not (may_edit or is_sample):
+            fails.append(f"TAMPER: test file deleted: {path} (task card has may_edit_tests=false "
+                         "and the file is not listed in .forge-samples)")
+        if status in "MR" and is_test and not may_edit:
+            fails.append(f"TAMPER: existing test file modified: {path} "
+                         "(task card has may_edit_tests=false; add new tests instead)")
+        test_ok = is_test and (status == "A" or may_edit or (status == "D" and is_sample))
+        sample_del = status == "D" and is_sample
+        if not (glob_match(path, card["owns"]) or glob_match(path, common) or test_ok or sample_del):
+            fails.append(f"SCOPE: {path} is outside this task's `owns` list {card['owns']}")
+        if status == "D":
+            # Assertions in a deleted non-sample test still count as removed (no net drop);
+            # a deleted sample's assertions never protected real behaviour, so they are free.
+            if is_test and not is_sample:
+                removed_test_asserts += sum(1 for l in removed_lines(wt, base, path) if assert_re.search(l))
+            continue
+        add = added_lines(wt, base, path)
+        total += len(add)
+        if glob_match(path, scene_globs):
+            if not card.get("scene_edits"):
+                fails.append(f"SCENE: {path} is a scene/resource file; this card has scene_edits=false. "
+                             "Build node trees in code or ask for a scene card (see docs/ENGINE.md).")
+            elif len(add) + len(removed_lines(wt, base, path)) > max_scene:
+                fails.append(f"SCENE: {path} diff exceeds {max_scene} lines; bulk hand-editing scene files "
+                             "is forbidden. Generate it with a tool script or leave it to the human editor.")
+        if is_test:
+            added_test_asserts += sum(1 for l in add if assert_re.search(l))
+            removed_test_asserts += sum(1 for l in removed_lines(wt, base, path) if assert_re.search(l))
+            for l in add:
+                for s in skips:
+                    if s.search(l):
+                        fails.append(f"TAMPER: skip/disable marker added in {path}: {l.strip()[:120]}")
+        elif glob_match(path, src_globs):
+            for l in add:
+                for rx in forbid:
+                    if rx.search(l):
+                        fails.append(f"HOLLOW: forbidden pattern /{rx.pattern}/ in {path}: {l.strip()[:120]}")
+                for rx in test_detect:
+                    if rx.search(l):
+                        fails.append(f"CHEAT: production code appears to detect test mode in {path}: {l.strip()[:120]}")
+        fp = wt / path
+        if fp.is_file() and glob_match(path, src_globs + tests):
+            with fp.open(errors="replace") as fh:
+                n = sum(1 for _ in fh)
+            if n > max_lines:
+                fails.append(f"SIZE: {path} has {n} lines (> {max_lines}); split it into cohesive units.")
+    if removed_test_asserts > added_test_asserts and removed_test_asserts:
+        fails.append(f"TAMPER: net assertions in tests decreased ({removed_test_asserts} removed, "
+                     f"{added_test_asserts} added).")
+    if card.get("tests_required") and added_test_asserts == 0:
+        fails.append("TESTS: task requires tests but no new assertions were added under test paths.")
+    if total > max_diff:
+        fails.append(f"SIZE: diff adds {total} lines (> {max_diff}). Task is too big or code is bloated.")
+    paths = {p for _, p, _ in files}
+    for d in card.get("docs", []):
+        if not any(glob_match(p, [d]) for p in paths):
+            fails.append(f"DOCS: task requires updating {d} but it was not changed.")
+    fails += doc_coverage(proj, wt, [p for s, p, _ in files if s != "D"])
+    return fails
+
+
+def doc_coverage(proj, wt, paths):
+    """Public C/C++ prototypes in headers and Python defs need a doc comment."""
+    P = proj.c("policy", default={})
+    if not P.get("doc_check", True):
+        return []
+    fails = []
+    proto = re.compile(r"^[A-Za-z_][\w\s\*]*\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*;")
+    for path in paths:
+        fp = wt / path
+        if not fp.is_file():
+            continue
+        lines = fp.read_text(errors="replace").splitlines()
+        if path.endswith((".h", ".hpp")):
+            for i, l in enumerate(lines):
+                if proto.match(l) and not l.startswith(("static", "typedef", "return")):
+                    prev = lines[i - 1].strip() if i else ""
+                    if not (prev.endswith("*/") or prev.startswith("//") or prev.startswith("*")):
+                        fails.append(f"DOCS: {path}:{i+1} public function lacks a doc comment: {l.strip()[:80]}")
+        elif path.endswith(".gd") and not glob_match(path, P.get("test_globs", [])) and not path.startswith("addons/"):
+            for i, l in enumerate(lines):
+                m = re.match(r"^(?:static )?func ([A-Za-z]\w*)", l)
+                if m and not (lines[i - 1].strip().startswith("##") if i else False):
+                    fails.append(f"DOCS: {path}:{i+1} public func {m.group(1)} lacks a ## doc comment")
+                if P.get("gd_strict_typing", True):
+                    fails += [f"TYPING: {path}:{i+1} {e}: {l.strip()[:90]}" for e in gd_untyped(l)]
+        elif path.endswith(".py") and "/tests/" not in f"/{path}":
+            for i, l in enumerate(lines):
+                m = re.match(r"^(def|class) ([A-Za-z]\w*)", l)
+                if m and not m.group(2).startswith("_"):
+                    nxt = next((x.strip() for x in lines[i + 1:i + 4] if x.strip()), "")
+                    if not nxt.startswith(('"""', "'''", 'r"""')):
+                        fails.append(f"DOCS: {path}:{i+1} public {m.group(1)} {m.group(2)} lacks a docstring")
+    return fails
+
+
+def gd_untyped(line):
+    """Static-typing lint for one GDScript line (backs up Godot's warnings-as-errors)."""
+    errs = []
+    m = re.match(r"^\s*(?:static\s+)?func\s+\w+\s*\((.*)\)\s*(->\s*[\w\[\], .]+)?\s*:", line)
+    if m:
+        for prm in filter(None, (x.strip() for x in m.group(1).split(","))):
+            if ":" not in prm.split("=")[0]:
+                errs.append(f"untyped parameter `{prm}`")
+        if not m.group(2):
+            errs.append("missing return type (-> T / -> void)")
+    if re.match(r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:var|const)\s+\w+\s*(=(?!=)|$)", line):
+        errs.append("untyped variable (use `: Type` or `:=`)")
+    return errs
+
+
+def gate_layers(proj, wt):
+    """Architecture boundaries: each layer may only include/import allowed layers."""
+    L = proj.c("layers", default=None)
+    if not L:
+        return []
+    root = wt / L.get("root", "src")
+    allow = L.get("allow", {})
+    forbid_h = L.get("forbid_headers", {})
+    inc = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]')
+    imp = re.compile(r"^\s*(?:from|import)\s+([\w\.]+)")
+    res = re.compile(r'res://' + re.escape(L.get("root", "src")) + r'/([^"\']+)')
+    forbid_p = {k: [re.compile(x) for x in v] for k, v in L.get("forbid_patterns", {}).items()}
+    fails = []
+    if not root.exists():
+        return []
+    for f in root.rglob("*"):
+        if not f.is_file() or f.suffix not in (".c", ".h", ".cpp", ".hpp", ".cc", ".py", ".gd", ".cs", ".lua"):
+            continue
+        layer = f.relative_to(root).parts[0]
+        if layer not in allow:
+            continue
+        for n, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
+            code = line.strip()
+            is_comment = code.startswith(("//", "/*", "*", "--")) or (code.startswith("#") and f.suffix in (".gd", ".py"))
+            for rx in ([] if is_comment else forbid_p.get(layer, [])):
+                if rx.search(line):
+                    fails.append(f"LAYERS: {f.relative_to(wt)}:{n} ({layer}) forbidden /{rx.pattern}/: {line.strip()[:100]}")
+            m = res.search(line) if f.suffix == ".gd" else (inc.match(line) or imp.match(line))
+            if not m:
+                continue
+            target = m.group(1).replace(".", "/") if f.suffix == ".py" else m.group(1)
+            head = target.split("/")[0]
+            rel = f.relative_to(wt)
+            if head in allow and head != layer and head not in allow[layer]:
+                fails.append(f"LAYERS: {rel}:{n} ({layer}) may not depend on {head}; allowed: {allow[layer]}")
+            if Path(target).name in forbid_h.get(layer, []):
+                fails.append(f"LAYERS: {rel}:{n} ({layer}) may not include {target}")
+    return fails
+
+
+def run_gates(proj, wt, base, card):
+    """Run all gates in order; stop at first failing group. Returns (ok, report)."""
+    order = proj.c("gates", "order", default=["policy", "layers"])
+    cmds = proj.c("gates", "cmd", default={})
+    nlines = proj.c("budget", "max_gate_output_lines", default=80)
+    gtimeout = proj.c("gates", "timeout_sec", default=900)
+    for g in order:
+        if g == "policy":
+            fails = gate_policy(proj, wt, base, card)
+        elif g == "layers":
+            fails = gate_layers(proj, wt)
+        elif g in cmds:
+            try:
+                r = sh(cmds[g], cwd=wt, check=False, timeout=gtimeout,
+                       env=dict(os.environ, FORGE_BASE=base))
+                fails = [] if r.returncode == 0 else [f"`{cmds[g]}` exited {r.returncode}:\n" +
+                                                     tail(r.stdout + r.stderr, nlines)]
+            except subprocess.TimeoutExpired:
+                fails = [f"`{cmds[g]}` timed out after {gtimeout}s (infinite loop? slow test?)"]
+        else:
+            continue
+        if fails:
+            uniq = list(dict.fromkeys(fails))
+            return False, f"GATE `{g}` FAILED:\n" + "\n".join(f"- {x}" for x in uniq[:40])
+    return True, "all gates passed: " + ", ".join(order)
+
+
+# ------------------------------------------------------------- orchestration
+def other(vendor):
+    """Legacy two-vendor fallback partner: claude<->codex, everything else -> codex."""
+    return "claude" if vendor == "codex" else "codex"
+
+
+def review_pool(proj):
+    """Vendors cross review may pick from: [agents] review_pool, else [agents] workers."""
+    return list(proj.c("agents", "review_pool", default=None) or proj.c("agents", "workers", default=["claude"]))
+
+
+def review_candidates(proj, author):
+    """Cross-review candidates for `author`'s work, best first (never the author itself).
+
+    Ranked by distance from the author, keeping review_pool order inside each rank:
+    1. other model family AND other CLI   (codex reviews claude; claude reviews oc-kimi)
+    2. other family, same CLI             (glm reviews claude; oc-glm reviews oc-kimi)
+    3. same family, other CLI             (oc-glm reviews glm)
+    4. same family, same CLI
+    If the pool has nothing but the author: the legacy partner other(author), so old configs
+    such as workers = ["claude"] still get codex as reviewer."""
+    names = vendor_names(proj)
+    pool = [v for v in dict.fromkeys(review_pool(proj)) if v in names and v != author]
+    fam, har = family_of(proj, author), harness_of(proj, author)
+    ranked = sorted(pool, key=lambda v: (family_of(proj, v) == fam, harness_of(proj, v) == har))
+    if not ranked and other(author) != author:
+        ranked = [other(author)]
+    return ranked
+
+
+def cross_reviewer(proj, author):
+    """First available review candidate; WAIT when all of them are cooling down right now."""
+    ranked = review_candidates(proj, author)
+    for v in ranked:
+        if available(proj, v):
+            return v
+    # [agents] self_review_fallback: when every other reviewer is cooling down, let the
+    # author's own vendor review rather than leave finished work waiting.
+    if proj.c("agents", "self_review_fallback", default=False) and author in vendor_names(proj) \
+            and available(proj, author):
+        return author
+    return WAIT if ranked else other(author)
+
+
+def pick_worker(proj, card, attempt, counter=[0], advance=True):
+    """Choose the worker vendor for an attempt, or None when no suitable vendor is free now.
+
+    Pinned card agent wins; otherwise round-robin over the available vendors in [agents]
+    workers (the mutable default `counter` is a deliberate process-wide cursor, guarded by
+    ROUND_LOCK; advance=False peeks without moving it). From attempt 3, if swap_on_retry,
+    rotate to another available vendor in workers: a fresh model often unsticks a task the
+    first one loops on. Cooling-down or disabled vendors are skipped."""
+    workers = proj.c("agents", "workers", default=["claude"])
+    avail = [v for v in workers if available(proj, v)]
+    if not avail and card["agent"] not in vendor_names(proj):
+        # [agents] fallback_workers: used only when every vendor in workers is cooling down
+        # (e.g. Claude writes only when Codex and the OpenCode pool are both out).
+        fb = proj.c("agents", "fallback_workers", default=[]) or []
+        avail = [v for v in fb if v in vendor_names(proj) and available(proj, v)]
+    if card["agent"] in vendor_names(proj):
+        w = card["agent"]
+    elif not avail:
+        return None
+    else:
+        with ROUND_LOCK:
+            w = avail[counter[0] % len(avail)]
+            if advance:
+                counter[0] += 1
+    # After two failed attempts, rotate to a different vendor in workers (fresh eyes):
+    # attempt 3 -> first other vendor, attempt 4 -> next, ... (two vendors = plain swap).
+    if attempt >= 3 and proj.c("agents", "swap_on_retry", default=True) and len(workers) > 1:
+        alts = [v for v in avail if v != w]
+        if alts:
+            w = alts[(attempt - 3) % len(alts)]
+    return w if available(proj, w) else None
+
+
+def pick_reviewer(proj, worker):
+    """Reviewer vendor for a worker per [agents] reviewer: a vendor name, None when review is
+    disabled, or WAIT when the reviewer(s) it may use are all cooling down."""
+    r = proj.c("agents", "reviewer", default="cross")
+    if r == "none":
+        return None
+    if r == "cross":
+        return cross_reviewer(proj, worker)
+    return r if available(proj, r) else WAIT
+
+
+def ensure_worktree(proj, tid):
+    """Create (or reuse) .forge/worktrees/<id> on branch forge/<id> from main.
+
+    Reusing an existing branch means an interrupted run resumes the previous work."""
+    wt = proj.wts / tid
+    branch = f"forge/{tid}"
+    if not wt.exists():
+        exists = git(proj.root, "branch", "--list", branch)
+        if exists:
+            git(proj.root, "worktree", "add", str(wt), branch)
+        else:
+            git(proj.root, "worktree", "add", "-b", branch, str(wt), proj.main)
+    return wt, branch
+
+
+def commit_all(wt, msg):
+    """Stage and commit everything in the worktree; False if there was nothing to commit.
+
+    --no-verify: project hooks must not block the orchestrator; the gates are the checks."""
+    git(wt, "add", "-A")
+    r = sh(["git", "-C", str(wt), "commit", "-q", "--no-verify", "-m", msg], check=False)
+    return r.returncode == 0
+
+
+def sync_main(wt, main):
+    """Merge main into the task branch. On conflict abort and return (False, files)."""
+    r = sh(["git", "-C", str(wt), "merge", "--no-edit", "-q", main], check=False)
+    if r.returncode != 0:
+        conflicts = git(wt, "diff", "--name-only", "--diff-filter=U", check=False)
+        sh(["git", "-C", str(wt), "merge", "--abort"], check=False)
+        return False, conflicts
+    return True, ""
+
+
+def event_excerpt(report, max_lines=25, max_chars=2500):
+    """Gate report trimmed for events.log: indented, at most max_lines / max_chars."""
+    lines = report.strip().splitlines()
+    out = "\n".join("    " + l[:300] for l in lines[:max_lines])
+    if len(lines) > max_lines:
+        out += f"\n    [... {len(lines) - max_lines} more lines; see `forge status` / .forge/state.json]"
+    return out[:max_chars]
+
+
+def restore_deps(proj, wt, tid):
+    """Run [setup] restore (e.g. `dotnet restore`) in the worktree before a worker starts.
+
+    Agent sandboxes may have no network; restoring here, outside any sandbox, fills the
+    package cache and obj/ so offline builds inside the sandbox still work. Failure is
+    logged, not fatal: the build gate will report the real error."""
+    cmd = proj.c("setup", "restore", default="")
+    if not cmd:
+        return True
+    try:
+        r = sh(cmd, cwd=wt, check=False, timeout=proj.c("setup", "timeout_sec", default=600))
+    except subprocess.TimeoutExpired:
+        proj.event(f"{tid}: restore timed out: {cmd}")
+        return False
+    if r.returncode != 0:
+        proj.event(f"{tid}: restore FAILED (`{cmd}` rc={r.returncode})\n" + event_excerpt(r.stdout + r.stderr, 10))
+    return r.returncode == 0
+
+
+def render(tpl, **kw):
+    """Fill {{KEY}} placeholders in a prompt template (no templating engine, by design)."""
+    for k, v in kw.items():
+        tpl = tpl.replace("{{" + k + "}}", str(v))
+    return tpl
+
+
+# ---------------------------------------------------------------------------------------
+# Context pack (token efficiency). See docs/CONTEXT_PACK.md.
+# Agents used to open spec/SPEC.md and docs/DECISIONS.md whole on most cards; every byte they
+# read is re-sent on each later turn of the session. forge instead extracts the parts the card
+# needs and puts them in the prompt; the full files stay available for grep/range reads.
+
+MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+SPEC_REF_RE = re.compile(r"§\s*(\d+(?:\.\d+)*)")
+DEC_REF_RE = re.compile(r"\bDEC-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b")
+
+
+def md_sections(text):
+    """Split markdown into sections: [(level, title, body_with_heading)].
+
+    A section runs to the next heading of the same or a higher level, so a `##` section
+    includes its `###` children. Headings inside ``` fences are ignored."""
+    lines = text.splitlines(keepends=True)
+    heads, fence = [], False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fence = not fence
+            continue
+        m = None if fence else MD_HEADING_RE.match(line)
+        if m:
+            heads.append((i, len(m.group(1)), m.group(2)))
+    out = []
+    for n, (i, lvl, title) in enumerate(heads):
+        end = len(lines)
+        for j, l2, _ in heads[n + 1:]:
+            if l2 <= lvl:
+                end = j
+                break
+        out.append((lvl, title, "".join(lines[i:end]).rstrip() + "\n"))
+    return out
+
+
+def heading_number(title):
+    """'2. Non-negotiable architecture' -> '2'; '9.4 M3 decisions' -> '9.4'; else None."""
+    m = re.match(r"(\d+(?:\.\d+)*)\.?(\s|$)", title)
+    return m.group(1) if m else None
+
+
+def select_spec_sections(spec_text, refs, milestone):
+    """Spec sections the card needs: numbered refs (§N / §N.M), plus every heading that names
+    the card's milestone as a word (e.g. '### M7 — Combat core', '### 9.8 M7 decisions').
+    A section already contained in a selected parent is not repeated."""
+    picked = []
+    mtok = re.compile(rf"(?<![A-Za-z0-9])M{milestone}(?![0-9])") if milestone not in (None, "") else None
+    for lvl, title, body in md_sections(spec_text):
+        num = heading_number(title)
+        if (num and num in refs) or (mtok and mtok.search(title)):
+            if not any(body in p for p in picked):
+                picked = [p for p in picked if p not in body]   # a parent replaces its children
+                picked.append(body)
+    return picked
+
+
+def decision_entries(dec_text):
+    """{DEC-id: entry text} for '## DEC-xxx — title' entries in docs/DECISIONS.md."""
+    out = {}
+    for lvl, title, body in md_sections(dec_text):
+        m = DEC_REF_RE.match(title)
+        if m:
+            out.setdefault(m.group(0), body)
+    return out
+
+
+def build_context(proj, card, role="work"):
+    """Return the context-pack markdown for one card ('' when [context] enabled = false).
+
+    Contents, in order (each part optional): spec sections (always_spec + §refs in the card +
+    milestone headings), decisions the card names, an index of all decision titles, and the
+    exact gate commands. Truncated at [context] max_chars with a visible marker."""
+    if not proj.c("context", "enabled", default=True):
+        return ""
+    raw = card.get("raw", "")
+    parts = []
+    spec_rel = proj.c("project", "spec", default="spec/SPEC.md")
+    spec_p = proj.root / spec_rel
+    if spec_p.exists():
+        refs = set(str(r) for r in proj.c("context", "always_spec", default=[]))
+        refs |= set(SPEC_REF_RE.findall(raw))
+        secs = select_spec_sections(spec_p.read_text(), refs, card.get("milestone"))
+        if secs:
+            parts.append(f"### From {spec_rel} (only the sections this card needs)\n\n" + "\n".join(secs))
+    dec_rel = proj.c("context", "decisions", default="docs/DECISIONS.md")
+    dec_p = proj.root / dec_rel
+    if dec_p.exists():
+        entries = decision_entries(dec_p.read_text())
+        named = [i for i in dict.fromkeys(DEC_REF_RE.findall(raw)) if i in entries]
+        if named:
+            parts.append(f"### Decisions this card names (from {dec_rel})\n\n" + "\n".join(entries[i] for i in named))
+        if entries and proj.c("context", "decision_index", default=False):
+            titles = [l.lstrip("# ").rstrip() for l in dec_p.read_text().splitlines()
+                      if l.startswith("#") and DEC_REF_RE.match(l.lstrip("# "))]
+            parts.append(f"### Index of {dec_rel} (titles only; grep the id for the full entry)\n\n"
+                         + "\n".join(f"- {t}" for t in titles) + "\n")
+    if role == "work" and proj.c("context", "gate_commands", default=True):
+        cmds = proj.c("gates", "cmd", default={}) or {}
+        if cmds:
+            parts.append("### Gate commands (exactly what forge runs; already quiet, use these)\n\n"
+                         + "\n".join(f"- {k}: `{v}`" for k, v in cmds.items()) + "\n")
+    if not parts:
+        return ""
+    text = "\n".join(parts)
+    cap = proj.c("context", "max_chars", default=16000)
+    if cap and len(text) > cap:
+        text = text[:cap] + "\n[... context pack truncated at [context] max_chars; grep the source files ...]\n"
+    return text
+
+
+CONTEXT_HEADER = ("## Context pack (extracted by forge)\n"
+                  "These are the spec sections and decisions this card relies on. Use them instead of reading "
+                  "spec/SPEC.md or docs/DECISIONS.md whole; open those files only with grep or line ranges "
+                  "for something missing here.\n\n")
+
+
+def with_context(tpl, context):
+    """Fill {{CONTEXT}}; projects whose customized prompt lacks the placeholder get it appended."""
+    block = (CONTEXT_HEADER + context) if context else ""
+    if "{{CONTEXT}}" in tpl:
+        return tpl.replace("{{CONTEXT}}", block)
+    return tpl + ("\n\n" + block if block else "")
+
+
+# Files the planner rewrites; a pending edit to them must not block `forge run`/`forge up`.
+DIRTY_OK = {"docs/SPEC_ISSUES.md"}
+
+
+def branch_author(proj, wt):
+    """Vendor that produced the newest work on this branch, read from forge's own
+    "<ID>: attempt N by <vendor>" commit messages. Used by regate so the cross-vendor
+    reviewer is chosen against the vendor that actually wrote the change (task state
+    may name a later, failed attempt). None when no such commit exists."""
+    log = git(wt, "log", "--format=%s", f"{proj.main}..HEAD")
+    for subj in log.splitlines():
+        m = re.search(r": attempt \d+ by ([\w.-]+)$", subj)
+        if m and m.group(1) in vendor_names(proj):
+            return m.group(1)
+    return None
+
+
+def run_task(proj, card, regate=False, continue_work=False):
+    """Full lifecycle of one card: attempts of work -> gates -> review -> serialized merge.
+
+    regate=True (`forge regate`): the first pass skips the worker and gates/reviews/merges
+    the work already on forge/<ID>. If that fails, stop (state gates_failed/review_failed)
+    unless continue_work, in which case normal worker attempts follow with the report as
+    feedback. Returns True when merged. Every exit path records state; see docs/LIFECYCLE.md.
+
+    Usage limits (docs/LIMITS.md): a worker that hits one hands the card (and its partial work)
+    to the next free vendor without charging an attempt; a reviewer that hits one is replaced
+    by the next allowed reviewer. When nobody suitable is free, the card is parked as `todo`
+    (with `pending_review` if only the review is missing) and resumes when a vendor frees up."""
+    tid = card["id"]
+    wt, branch = ensure_worktree(proj, tid)
+    restore_deps(proj, wt, tid)
+    max_attempts = proj.c("budget", "max_attempts", default=3)
+    context = build_context(proj, card, "work")   # once per card: identical text on every attempt
+    tstate = proj.task_state(tid)
+    resume = bool(tstate.get("pending_review")) and not regate
+    feedback = tstate.get("feedback") or "None - this is the first attempt."
+    last_fail = None
+    attempts = tstate.get("attempts", 0)
+    proj.set_task(tid, status="running", branch=branch,
+                  event={"msg": "resumed: review pending" if resume else "started"})
+    if regate:
+        attempts = 0   # a re-gate is a fresh start for the attempt budget
+    skip_work = regate or resume
+    hops, max_hops = 0, 2 * len(vendor_names(proj))   # limit handoffs; bounded so flapping can't loop
+
+    def park(msg, **kw):
+        # Back to todo without charging anything; feedback is kept for whoever continues.
+        proj.set_task(tid, status="todo", attempts=attempts, feedback=feedback, event={"msg": msg}, **kw)
+        return False
+
+    while (attempts < max_attempts or skip_work) and not STOP.is_set():
+        if skip_work:
+            # Re-gate / resume pass: no worker; judge the existing branch as committed.
+            worker = branch_author(proj, wt) or proj.task_state(tid).get("agent") or pick_worker(proj, card, 1)
+            proj.set_task(tid, agent=worker)
+            res = AgentResult(True, "existing branch")
+            commit_all(wt, f"{tid}: uncommitted changes picked up by {'regate' if regate else 'resume'}")
+            proj.event(f"{tid}: {'re-gating' if regate else 'resuming review of'} existing branch {branch} "
+                       f"({git(wt, 'rev-parse', '--short', 'HEAD')})")
+        else:
+            if regate and not continue_work:
+                proj.event(f"{tid}: re-gate failed; branch kept. Fix by hand + `forge regate {tid}`, "
+                           f"or `forge regate {tid} --continue` to let workers retry.")
+                return False
+            worker = pick_worker(proj, card, attempts + 1)
+            if worker is None:
+                proj.event(f"{tid}: no worker vendor is free (cooling down or unavailable) - card waits")
+                return park("waiting for a free worker vendor")
+            attempts += 1
+            proj.set_task(tid, attempts=attempts, agent=worker, status="running", pending_review=False)
+            prompt = render(with_context(proj.prompt("worker"), context), CARD=card["raw"], FEEDBACK=feedback,
+                            ATTEMPT=attempts, MAX_ATTEMPTS=max_attempts, TASK_ID=tid)
+            res = run_agent(proj, worker, "work", prompt, wt, tid)
+            if res.limited:
+                attempts -= 1   # not the card's fault
+                hops += 1
+                # Keep what the stopped worker wrote; this commit message is not an "attempt N by"
+                # line, so branch_author still names the last vendor that finished an attempt.
+                if commit_all(wt, f"{tid}: partial work by {worker} (stopped by usage limit)") \
+                        and "stopped mid-task" not in feedback:
+                    feedback = (f"The previous worker ({worker}) stopped mid-task because of a usage limit. "
+                                "Its partial changes are already in your worktree: check them, keep what is "
+                                "right, and finish the task.\nEarlier feedback: " + feedback)
+                proj.set_task(tid, attempts=attempts, event={"msg": f"{worker} unavailable (limit/setup); handing over"})
+                if hops > max_hops:
+                    return park("too many usage-limit handoffs in one go")
+                continue
+            commit_all(wt, f"{tid}: attempt {attempts} by {worker}")
+        first_pass, skip_work = skip_work, False
+        ok, conflicts = sync_main(wt, proj.main)
+        if not ok:
+            feedback = (f"Your branch conflicts with {proj.main} in: {conflicts}. {proj.main} has moved; "
+                        "re-read those files and redo your change on top of the current code.")
+            if first_pass and regate:   # never discard existing work during a re-gate
+                proj.event(f"{tid}: re-gate: branch conflicts with {proj.main} in {conflicts}; resolve by hand")
+                proj.set_task(tid, status="blocked", event={"msg": "regate conflict", "files": conflicts})
+                return False
+            sh(["git", "-C", str(wt), "reset", "-q", "--hard", proj.main], check=False)
+            proj.set_task(tid, event={"msg": "merge conflict", "files": conflicts})
+            continue
+        base = git(wt, "merge-base", "HEAD", proj.main)
+        gok, report = run_gates(proj, wt, base, card)
+        if not res.ok and not res.text:
+            report = f"Agent exited rc={res.rc} without finishing.\n" + report
+        if not gok:
+            proj.event(f"{tid}: gates FAILED\n" + event_excerpt(report))
+            proj.set_task(tid, status="gates_failed", pending_review=False,
+                          event={"msg": "gates failed", "report": report[:2000]})
+            if report == last_fail and not first_pass:
+                proj.event(f"{tid}: identical failure twice - blocking to save tokens")
+                break
+            last_fail = report
+            feedback = report
+            continue
+        # Cross review against whoever wrote the branch's newest work: a failed attempt that
+        # changed nothing (e.g. the worker crashed) must not make the author its own reviewer.
+        author = branch_author(proj, wt) or worker
+        rv = None
+        while True:
+            reviewer = pick_reviewer(proj, author)
+            if reviewer in (None, WAIT):
+                break
+            diff = git(wt, "diff", f"{base}...HEAD", check=False)
+            cap = proj.c("budget", "max_review_diff_chars", default=60000)
+            if len(diff) > cap:
+                diff = diff[:cap] + "\n[... diff truncated; read files directly ...]"
+            rprompt = render(with_context(proj.prompt("reviewer"), build_context(proj, card, "review")),
+                             CARD=card["raw"], DIFF=diff, GATES=report, TASK_ID=tid)
+            rv = run_agent(proj, reviewer, "review", rprompt, wt, tid, schema="review")
+            if rv.limited:   # that reviewer now cools down; pick_reviewer offers the next one
+                hops += 1
+                if hops > max_hops:
+                    reviewer = WAIT
+                    break
+                continue
+            break
+        if reviewer == WAIT:
+            proj.event(f"{tid}: gates passed, but every reviewer allowed for {author}'s work is cooling down "
+                       "- card waits for review (no worker rerun needed)")
+            return park("waiting for a free reviewer", pending_review=True)
+        if reviewer:
+            verdict = (rv.data or {}).get("verdict", "FAIL" if rv.data else "ERROR")
+            (proj.logs / f"{tid}-review-{attempts}.json").write_text(json.dumps(rv.data, indent=2))
+            if verdict != "PASS":
+                issues = (rv.data or {}).get("issues", []) or [{"problem": rv.text[:1500] or "reviewer gave no verdict"}]
+                feedback = "REVIEWER REJECTED your change. Fix every blocking issue:\n" + "\n".join(
+                    f"- [{i.get('severity', 'blocker')}] {i.get('file', '')}: {i.get('problem', '')} "
+                    f"-> {i.get('fix', '')}" for i in issues)
+                proj.event(f"{tid}: review {verdict} by {reviewer}")
+                proj.set_task(tid, status="review_failed", pending_review=False,
+                              event={"msg": f"review {verdict}", "issues": issues})
+                continue
+        with MERGE_LOCK:
+            ok, conflicts = sync_main(wt, proj.main)
+            if ok and git(wt, "rev-parse", f"{proj.main}") != base:
+                gok, report = run_gates(proj, wt, git(wt, "merge-base", "HEAD", proj.main), card)
+                if not gok:
+                    feedback = f"After merging latest {proj.main}, gates fail:\n{report}"
+                    proj.set_task(tid, status="gates_failed", event={"msg": "gates failed after sync", "report": report[:2000]})
+                    continue
+            if not ok:
+                feedback = f"Conflict with {proj.main} in {conflicts}; redo on top of current code."
+                proj.set_task(tid, event={"msg": "merge conflict at merge time", "files": conflicts})
+                sh(["git", "-C", str(wt), "reset", "-q", "--hard", proj.main], check=False)
+                continue
+            r = sh(["git", "-C", str(proj.root), "merge", "--ff-only", "-q", branch], check=False)
+            if r.returncode != 0:
+                proj.event(f"{tid}: ff-merge failed: {r.stderr.strip()}")
+                proj.set_task(tid, status="blocked", event={"msg": "ff merge failed", "err": r.stderr})
+                return False
+        proj.event(f"{tid}: MERGED into {proj.main}")
+        proj.set_task(tid, status="done", pending_review=False, feedback="", event={"msg": "merged"})
+        sh(["git", "-C", str(proj.root), "worktree", "remove", "--force", str(wt)], check=False)
+        return True
+    if STOP.is_set() and attempts < max_attempts:
+        return park("run stopped")   # budget/run cap/SIGTERM
+    proj.set_task(tid, status="blocked", event={"msg": "attempts exhausted", "last": feedback[:2000]})
+    proj.event(f"{tid}: BLOCKED - needs human or `forge reset {tid}`")
+    return False
+
+
+def can_start(proj, card, t):
+    """True when a vendor this card needs next is free: a reviewer for a card parked with
+    pending_review, otherwise a worker for its next attempt (pinned agent or the pool)."""
+    if t.get("pending_review"):
+        return pick_reviewer(proj, t.get("agent") or "claude") != WAIT
+    return pick_worker(proj, card, t.get("attempts", 0) + 1, advance=False) is not None
+
+
+def ready_tasks(proj, cards, running, waiting=None):
+    """Cards that can start now: deps done, lowest open milestone (if strict), owns globs not
+    overlapping any running or already-selected card, and a free vendor (can_start).
+    Cards held back only by a missing vendor are appended to `waiting` when given."""
+    st = proj.load_state()["tasks"]
+    status = lambda t: st.get(t, {}).get("status", "todo")
+    pending = [c for c in cards.values() if status(c["id"]) not in ("done", "blocked") and c["id"] not in running]
+    if proj.c("project", "strict_milestones", default=True):
+        open_ms = [c["milestone"] for c in cards.values() if status(c["id"]) != "done"]
+        if open_ms:
+            pending = [c for c in pending if c["milestone"] == min(open_ms)]
+    busy = [g for r in running for g in cards[r]["owns"]]
+    out = []
+    for c in sorted(pending, key=lambda c: (c["milestone"], c["id"])):
+        if all(status(d) == "done" for d in c["deps"]) and not overlaps(c["owns"], busy):
+            if not can_start(proj, c, st.get(c["id"], {})):
+                if waiting is not None:
+                    waiting.append(c)
+                continue
+            out.append(c)
+            busy += c["owns"]
+    return out
+
+
+def overlaps(a, b):
+    """Conservative: same glob, or one glob's literal prefix contains the other."""
+    for x in a:
+        for y in b:
+            px, py = x.split("*")[0], y.split("*")[0]
+            if x == y or px.startswith(py) or py.startswith(px):
+                return True
+    return False
+
+
+def cmd_run(proj, args):
+    """`forge run`: pre-flight checks, then a thread-pool scheduler until nothing is runnable.
+
+    When the only thing left is cards waiting for cooling vendors, it stops with a message,
+    or with --wait sleeps until the next vendor frees up and carries on."""
+    dirty = [l for l in git(proj.root, "status", "--porcelain", "--untracked-files=no").splitlines()
+             if l.split(maxsplit=1)[-1] not in DIRTY_OK]
+    if dirty:
+        die(f"main checkout has uncommitted changes; commit or stash them first:\n" + "\n".join(dirty))
+    if git(proj.root, "rev-parse", "--abbrev-ref", "HEAD") != proj.main:
+        die(f"main checkout must be on branch {proj.main}")
+    cards = load_cards(proj)
+    if args.task:
+        cards = {k: v for k, v in cards.items() if k in args.task}
+    if not cards:
+        die("no task cards in tasks/ (run `forge plan` first)")
+    signal.signal(signal.SIGTERM, lambda *_: STOP.set())
+    load_limits(proj)
+    running = {}
+    proj.event(f"run: {len(cards)} cards, parallel={args.parallel}, mock={proj.mock}")
+    for v in vendor_names(proj):
+        t = cooldown_until(proj, v)
+        if t:
+            proj.event(f"run: {v} is cooling down until {fmt_time(t)}; cards fall back to other vendors")
+    with cf.ThreadPoolExecutor(max_workers=args.parallel) as ex:
+        while not STOP.is_set():
+            waiting = []
+            for c in ready_tasks(proj, cards, running, waiting)[: args.parallel - len(running)]:
+                running[c["id"]] = ex.submit(run_task, proj, c)
+            if not running:
+                if waiting:
+                    wake = next_wakeup(proj)
+                    ids = ", ".join(c["id"] for c in waiting)
+                    if wake and getattr(args, "wait", False):
+                        proj.event(f"run: {ids} wait for a vendor; sleeping until {fmt_time(wake)} (--wait)")
+                        while time.time() < wake + 1 and not STOP.is_set():
+                            time.sleep(min(5.0, max(0.2, wake + 1 - time.time())))
+                        continue
+                    proj.event(f"run: {ids} wait for a vendor that is cooling down or unavailable; "
+                               + (f"next one is free at {fmt_time(wake)} - rerun then, or use `forge run --wait`"
+                                  if wake else "fix the setup problem logged above, then rerun"))
+                break
+            done, _ = cf.wait(running.values(), return_when=cf.FIRST_COMPLETED, timeout=5)
+            for tid, fut in list(running.items()):
+                if fut in done:
+                    try:
+                        fut.result()
+                    except Exception as e:  # never let one task kill the run
+                        proj.event(f"{tid}: orchestrator error {e!r}")
+                        proj.set_task(tid, status="blocked", event={"msg": f"error {e!r}"})
+                    del running[tid]
+    cmd_status(proj, args)
+    st = proj.load_state()["tasks"]
+    if proj.c("agents", "auditor") and any(st.get(c, {}).get("status") == "done" for c in cards) and args.audit:
+        cmd_audit(proj, args)
+
+
+# ------------------------------------------------------------------ commands
+POLICY_BEGIN = "<!-- forge:policy-lists BEGIN"
+POLICY_END = "<!-- forge:policy-lists END -->"
+
+
+def render_policy_lists(root):
+    """Rewrite the AGENTS.md block between the forge:policy-lists markers from forge.toml [policy].
+
+    AGENTS.md is what agents read; forge.toml is what the gates enforce. Generating the
+    prose lists from the config means the two can never disagree (tests/check_docs.py
+    checks every preset). Returns True if AGENTS.md changed.
+    """
+    agents = Path(root) / "AGENTS.md"
+    text = agents.read_text()
+    if POLICY_BEGIN not in text or POLICY_END not in text:
+        raise SystemExit(f"forge: {agents} has no forge:policy-lists markers; see docs/PRESETS.md")
+    pol = tomllib.loads((Path(root) / "forge.toml").read_text()).get("policy", {})
+    fmt = lambda xs: ", ".join(f"`{x}`" for x in xs) or "(none)"
+    block = (f"{POLICY_BEGIN} (generated from forge.toml [policy] by `forge sync-agents`; do not edit by hand) -->\n"
+             f"- Touch only files matching the card's `owns` globs, plus the always-allowed paths\n"
+             f"  {fmt(pol.get('always_allowed', ['docs/**', 'CHANGELOG.md']))}, and **new** test files under\n"
+             f"  {fmt(pol.get('test_globs', ['tests/**']))}. Anything else fails the SCOPE gate.\n"
+             f"- Never modify these protected paths: {fmt(pol.get('protected', []))}.\n"
+             f"  If one of them is wrong, say so in your final message under `SPEC/INFRA ISSUES`.\n"
+             + (f"- Editor-owned files {fmt(pol['scene_globs'])} may only be changed by cards with\n"
+                f"  `scene_edits = true`, and only in small diffs (see docs/ENGINE.md).\n"
+                if pol.get("scene_globs") else "")
+             + POLICY_END)
+    start = text.index(POLICY_BEGIN)
+    end = text.index(POLICY_END) + len(POLICY_END)
+    new = text[:start] + block + text[end:]
+    changed = new != text
+    if changed:
+        agents.write_text(new)
+    # Same list for Claude's own permission layer: Edit/Write deny rules mirror `protected`.
+    settings = Path(root) / ".claude" / "settings.json"
+    if settings.exists():
+        cfg = json.loads(settings.read_text())
+        deny = [d for d in cfg.get("permissions", {}).get("deny", [])
+                if not d.startswith(("Edit(", "Write("))]
+        # Anchor to the project root ("/glob" = relative to the project in Claude Code): forge's
+        # gate matches `protected` from the root, but Claude treats a bare "tools/**" as matching
+        # any nested, case-insensitive "Tools/" dir too (e.g. Game.Core.Tests/Tools/).
+        deny += [f"{t}(/{g.lstrip('/')})" for g in pol.get("protected", []) for t in ("Edit", "Write")]
+        if cfg.get("permissions", {}).get("deny") != deny:
+            cfg.setdefault("permissions", {})["deny"] = deny
+            settings.write_text(json.dumps(cfg, indent=2) + "\n")
+            changed = True
+    return changed
+
+
+def cmd_sync_agents(proj, args):
+    """`forge sync-agents`: regenerate AGENTS.md lists and .claude Edit/Write deny rules from forge.toml."""
+    changed = render_policy_lists(proj.root)
+    print("AGENTS.md / .claude/settings.json updated from forge.toml [policy]; commit them."
+          if changed else "AGENTS.md and .claude/settings.json already in sync.")
+
+def cmd_init(args):
+    """`forge init`: copy template/common + preset, substitute @NAME@, git init + first commit."""
+    dest = Path(args.dir).resolve()
+    if (dest / "forge.toml").exists():
+        die(f"{dest} already has forge.toml")
+    preset = TEMPLATE / "presets" / args.preset
+    if not preset.exists():
+        die(f"unknown preset {args.preset}; have: {[p.name for p in (TEMPLATE / 'presets').iterdir()]}")
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(TEMPLATE / "common", dest, dirs_exist_ok=True)
+    shutil.copytree(preset, dest, dirs_exist_ok=True)
+    manifest = dest / ".forge-samples"
+    if args.no_sample and manifest.exists():
+        # Sample code only proves the gates on day one; real projects usually start clean.
+        for line in manifest.read_text().splitlines():
+            rel = line.strip()
+            if rel and not rel.startswith("#"):
+                (dest / rel).unlink(missing_ok=True)
+        manifest.unlink()
+    for f in list(dest.rglob("*@NAME@*")):
+        f.rename(f.with_name(f.name.replace("@NAME@", dest.name)))
+    for name in (f"{dest.name}.csproj", "forge.toml", "project.godot", "CMakeLists.txt", "conf.lua"):
+        f = dest / name
+        if f.exists():
+            f.write_text(f.read_text().replace("@NAME@", dest.name))
+    for f in list((dest / "tools").glob("*.sh")) + list((dest / "gates").glob("*")):
+        f.chmod(0o755)
+    if args.spec:
+        shutil.copy(args.spec, dest / "spec" / "SPEC.md")
+    for f in (dest / ".claude" / "hooks").glob("*.sh"):
+        f.chmod(0o755)
+    gi = dest / ".gitignore"
+    lines = gi.read_text().splitlines() if gi.exists() else []
+    for l in (".forge/", "build/"):
+        if l not in lines:
+            lines.append(l)
+    gi.write_text("\n".join(lines) + "\n")
+    render_policy_lists(dest)
+    if not (dest / ".git").exists():
+        sh(["git", "init", "-q", "-b", "main", str(dest)])
+    sh(["git", "-C", str(dest), "add", "-A"])
+    sh(["git", "-C", str(dest), "-c", "user.name=forge", "-c", "user.email=forge@localhost",
+        "commit", "-q", "-m", "forge init"], check=False)
+    print(f"Initialized {dest} (preset {args.preset}).\nNext: edit spec/SPEC.md, then `forge -C {dest} plan`.")
+
+
+def cmd_plan(proj, args):
+    """`forge plan`: planner agent (read-only) -> new task cards + docs/SPEC_ISSUES.md."""
+    vendor = check_vendor(proj, args.agent or proj.c("agents", "planner", default="claude"))
+    cards = load_cards(proj)
+    existing = "\n".join(f"- {c['id']} (M{c['milestone']}): {c['title']}" for c in cards.values()) or "none"
+    prompt = render(proj.prompt("planner"), SPEC=args.spec or proj.c("project", "spec", default="spec/SPEC.md"),
+                    MILESTONE=args.milestone or "the first milestone that has no task cards yet",
+                    EXISTING=existing)
+    res = run_agent(proj, vendor, "plan", prompt, proj.root, "plan", schema="plan")
+    if not res.data or "tasks" not in res.data:
+        die(f"planner returned no valid plan; see {res.log}")
+    new = 0
+    for t in res.data["tasks"]:
+        if t["id"] in cards:
+            continue
+        write_card(proj, t)
+        new += 1
+    issues = res.data.get("spec_issues", [])
+    # Always overwrite, so the file reflects only the latest plan run and never goes stale.
+    (proj.root / "docs").mkdir(exist_ok=True)
+    (proj.root / "docs" / "SPEC_ISSUES.md").write_text(
+        f"# Spec issues found by planner ({now()})\n\n"
+        + ("\n".join(f"- {i}" for i in issues) if issues else "No issues.") + "\n")
+    print(f"wrote {new} task cards to tasks/; {len(issues)} spec issues -> docs/SPEC_ISSUES.md")
+    print("Review/edit the cards, `git commit` them, then `forge run` or `forge up`.")
+
+
+def cmd_status(proj, args):
+    """`forge status`: task table, status counts, run count and estimated spend."""
+    cards = load_cards(proj)
+    st = proj.load_state()
+    rows = []
+    for tid, c in cards.items():
+        t = st["tasks"].get(tid, {})
+        last = (t.get("history") or [{}])[-1].get("msg", "")
+        rows.append((tid, f"M{c['milestone']}", t.get("status", "todo"), t.get("agent", c["agent"]),
+                     str(t.get("attempts", 0)), c["title"][:38], last[:30]))
+    hdr = ("TASK", "MS", "STATUS", "AGENT", "TRY", "TITLE", "LAST")
+    w = [max(len(r[i]) for r in rows + [hdr]) for i in range(len(hdr))]
+    for r in [hdr] + rows:
+        print("  ".join(x.ljust(w[i]) for i, x in enumerate(r)))
+    counts = {}
+    for r in rows:
+        counts[r[2]] = counts.get(r[2], 0) + 1
+    print(f"\n{counts}  agent runs: {st.get('agent_runs', 0)}  est. Claude spend: ${st.get('total_usd', 0):.2f}")
+    if st.get("vendor_runs"):
+        print("runs by vendor: " + ", ".join(f"{k} {v}" for k, v in sorted(st["vendor_runs"].items())))
+    if "grok_usd_reported" in st:
+        print(f"grok reported cost: ${st['grok_usd_reported']:.2f} (xAI's figure when it sends one; not in the budget)")
+    if "glm_usd_nominal" in st:
+        print(f"glm nominal cost: ${st['glm_usd_nominal']:.2f} (Claude Code's Anthropic-price estimate; "
+              "not what the Z.ai plan charges, not counted in the budget)")
+    if st.get("vendor_usd"):
+        print("opencode reported cost: " + ", ".join(f"{k} ${v:.2f}" for k, v in sorted(st["vendor_usd"].items()))
+              + " (API-price figures; not in the budget)")
+    for v, c in sorted((st.get("cooldowns") or {}).items()):
+        if float(c.get("until", 0)) > time.time():
+            print(f"{v} cooling down until {fmt_time(float(c['until']))}: {c.get('why', '')}  (`forge limits`)")
+
+
+def used_vendors(proj):
+    """Vendors this project's config refers to (workers, review pool, roles), plus opencode tables."""
+    ag = proj.c("agents", default={}) or {}
+    names = list(ag.get("workers", ["claude"])) + list(ag.get("review_pool", []) or [])
+    names += [ag.get(k) for k in ("planner", "auditor", "reviewer")]
+    names += vendor_names(proj)[len(VENDORS):]
+    known = vendor_names(proj)
+    return [v for v in dict.fromkeys(names) if v in known]
+
+
+def cmd_limits(proj, args):
+    """`forge limits`: per-vendor state (free / cooling until / disabled), allowance use for
+    vendors with monthly_usd, and --clear to lift cooldowns early (spend history is kept)."""
+    if args.clear is not None:
+        targets = set(args.clear)
+        unknown = targets - set(vendor_names(proj))
+        if unknown:
+            die(f"unknown vendor(s): {', '.join(sorted(unknown))}")
+
+        def f(s):
+            cd = s.get("cooldowns") or {}
+            for v in list(cd):
+                if not targets or v in targets:
+                    del cd[v]
+        proj.update_state(f)
+        pools = {pool_of(proj, v) for v in (targets or vendor_names(proj))} - {None}
+        for pool in sorted(pools):     # a plan-level cooldown is shared; clearing it clears it everywhere
+            pool_append(pool, {"kind": "clear", "project": str(proj.root)})
+        print("cooldowns cleared: " + (", ".join(sorted(targets)) if targets else "all")
+              + (f" (pools: {', '.join(sorted(pools))})" if pools else ""))
+    load_limits(proj)
+    st = proj.load_state()
+    rows = [("VENDOR", "HARNESS", "FAMILY", "STATE", "ALLOWANCE (spent/limit)")]
+    for v in dict.fromkeys(used_vendors(proj) + list((st.get("cooldowns") or {}).keys())):
+        if v not in vendor_names(proj):
+            continue
+        t = cooldown_until(proj, v)
+        c = COOLDOWNS.get(v)
+        pt = pool_until(proj, v)
+        state = "free" if not t else (f"cooling until {fmt_time(t)}"
+                                      + (f" ({c['why'][:50]})" if c and float(c["until"]) >= t
+                                         else f" (pool {pool_of(proj, v)})" if pt and pt >= t
+                                         else " (allowance window)"))
+        use = "  ".join(f"{lbl} ${s:.2f}/${lim:.2f}" for lbl, s, lim in allowance_use(proj, v)) or "-"
+        rows.append((v, harness_of(proj, v) or "?", family_of(proj, v), state, use))
+    w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(x.ljust(w[i]) for i, x in enumerate(r)).rstrip())
+    pools = {}
+    for v in used_vendors(proj):
+        if pool_of(proj, v):
+            pools.setdefault(pool_of(proj, v), []).append(v)
+    for pool, members in sorted(pools.items()):
+        use = "  ".join(f"{lbl} ${s:.2f}/${lim:.2f}" for lbl, s, lim in pool_use(proj, pool)) or "no caps set"
+        pt = pool_until(proj, members[0])
+        print(f"pool {pool} ({', '.join(members)}): {use}; "
+              + (f"cooling until {fmt_time(pt)}" if pt else "free") + f"  [{pool_path(pool)}]")
+
+
+def cmd_review(proj, args):
+    """`forge review`: re-run gates and optionally a reviewer on an existing worktree (no merge)."""
+    cards = load_cards(proj)
+    c = cards.get(args.task) or die(f"no card {args.task}")
+    wt = proj.wts / args.task
+    if not wt.exists():
+        die("no worktree for that task (already merged or never started)")
+    base = git(wt, "merge-base", "HEAD", proj.main)
+    ok, rep = run_gates(proj, wt, base, c)
+    print(rep)
+    if args.gates_only:
+        return
+    vendor = check_vendor(proj, args.agent or "codex")
+    rv = run_agent(proj, vendor, "review", render(with_context(proj.prompt("reviewer"), build_context(proj, c, "review")), CARD=c["raw"],
+                   DIFF=git(wt, "diff", f"{base}...HEAD"), GATES=rep, TASK_ID=args.task), wt, args.task, schema="review")
+    print(json.dumps(rv.data, indent=2) if rv.data else rv.text)
+
+
+def cmd_audit(proj, args):
+    """`forge audit`: whole-repo monitor agent; writes a report and any FIX-* cards."""
+    vendor = check_vendor(proj, getattr(args, "agent", None) or proj.c("agents", "auditor", default="codex"))
+    log = git(proj.root, "log", "--oneline", "-30")
+    prompt = render(proj.prompt("auditor"), GITLOG=log,
+                    SPEC=proj.c("project", "spec", default="spec/SPEC.md"))
+    res = run_agent(proj, vendor, "audit", prompt, proj.root, "audit", schema="audit")
+    d = res.data or {}
+    ts = time.strftime("%Y%m%d-%H%M")
+    rep = proj.dir / f"audit-{ts}.md"
+    rep.write_text(f"# Audit {ts} ({vendor}) verdict={d.get('verdict')}\n\n" + "\n".join(
+        f"- [{f.get('severity')}] {f.get('file', '')}: {f.get('issue', '')}" for f in d.get("findings", [])))
+    for t in d.get("new_tasks", []):
+        write_card(proj, t)
+    print(f"audit verdict={d.get('verdict')} findings={len(d.get('findings', []))} "
+          f"new fix cards={len(d.get('new_tasks', []))} -> {rep}")
+
+
+def cmd_reset(proj, args):
+    """`forge reset`: back to todo/0 attempts; --hard also drops worktree and branch."""
+    for tid in args.task:
+        wt = proj.wts / tid
+        if wt.exists() and args.hard:
+            sh(["git", "-C", str(proj.root), "worktree", "remove", "--force", str(wt)], check=False)
+            sh(["git", "-C", str(proj.root), "branch", "-D", f"forge/{tid}"], check=False)
+        proj.set_task(tid, status="todo", attempts=0, event={"msg": "reset by human"})
+        print(f"reset {tid}")
+
+
+def cmd_regate(proj, args):
+    """`forge regate`: gates + review + merge on the existing forge/<ID> branch, no worker run."""
+    cards = load_cards(proj)
+    load_limits(proj)   # respect cooldowns from earlier runs when choosing the reviewer
+    for tid in args.task:
+        c = cards.get(tid) or die(f"no card {tid}")
+        branch = f"forge/{tid}"
+        if not git(proj.root, "branch", "--list", branch) and not (proj.wts / tid).exists():
+            die(f"{tid}: no branch {branch} to re-gate; use `forge run --task {tid}`")
+        ok = run_task(proj, c, regate=True, continue_work=args.cont)
+        print(f"{tid}: {'merged' if ok else proj.task_state(tid).get('status', 'not merged')}")
+
+
+def cmd_upgrade(proj, args):
+    """`forge upgrade`: add files newer forge versions expect to an existing project.
+
+    Today: .forge-samples (from the preset, listing only sample files still present) and the
+    generated AGENTS.md/.claude policy lists. Never overwrites an existing .forge-samples.
+    Leaves changes uncommitted for the human to review and commit."""
+    preset = TEMPLATE / "presets" / args.preset
+    if not preset.exists():
+        die(f"unknown preset {args.preset}")
+    changed = []
+    src = preset / ".forge-samples"
+    dst = proj.root / ".forge-samples"
+    if src.exists() and not dst.exists():
+        keep = [l for l in src.read_text().splitlines()
+                if not l.strip() or l.startswith("#") or (proj.root / l.strip()).exists()]
+        dst.write_text("\n".join(keep) + "\n")
+        changed.append(".forge-samples")
+    agents = proj.root / "AGENTS.md"
+    if agents.exists() and POLICY_BEGIN in agents.read_text():
+        if render_policy_lists(proj.root):
+            changed.append("AGENTS.md/.claude/settings.json")
+    elif agents.exists():
+        print("note: AGENTS.md has no forge:policy-lists markers; add them (see docs/PRESETS.md) "
+              "or run the project's apply script, then `forge sync-agents`.")
+    print(("updated: " + ", ".join(changed) + "\nReview with `git diff`, then commit.") if changed
+          else "Nothing to upgrade.")
+
+
+def cmd_doctor(args):
+    """`forge doctor`: tool presence, CLI login status and glm checks (no secrets printed)."""
+    ok = True
+    for b in ("git", "tmux", "jq", "python3", "node", "claude", "codex", "godot", "gdlint", "gdformat",
+              "cmake", "cc", "shellcheck"):
+        p = shutil.which(b)
+        print(f"{'ok ' if p else 'MISSING'}  {b:10} {p or ''}")
+        ok &= bool(p) or b in ("shellcheck", "jq", "cmake", "cc", "godot", "gdlint", "gdformat")
+    if shutil.which("claude"):
+        r = sh(["claude", "auth", "status", "--text"], check=False)
+        print(f"claude auth: {'logged in' if r.returncode == 0 else 'NOT logged in -> run `claude auth login`'}")
+    if shutil.which("codex"):
+        r = sh(["codex", "login", "status"], check=False)
+        print(f"codex auth:  {'logged in' if r.returncode == 0 else 'NOT logged in -> run `codex login`'}")
+    ok &= doctor_glm(Path(args.root))
+    ok &= doctor_grok(Path(args.root))
+    ok &= doctor_opencode(Path(args.root))
+    if sys.version_info < (3, 11):
+        print("python >= 3.11 required"); ok = False
+    sys.exit(0 if ok else 1)
+
+
+def doctor_glm(root):
+    """glm checks for `forge doctor`: key present (never printed), endpoint reachable, and a
+    one-turn `claude -p` ping through glm_env. Returns False only when the project's
+    forge.toml actually uses glm (workers/review_pool/planner/auditor) and a check fails."""
+    try:
+        cfg = tomllib.loads((root / "forge.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        cfg = {}
+    ag = cfg.get("agents", {})
+    a = ag.get("glm", {})
+    used = "glm" in (list(ag.get("workers", [])) + list(ag.get("review_pool", []) or [])
+                     + [ag.get("planner"), ag.get("auditor"), ag.get("reviewer")])
+    key, src = glm_key(a)
+    print(f"glm key:     {'present (' + src + ')' if key else src}" + ("" if used else "  [glm not used by this project]"))
+    good = bool(key)
+    f = Path(a.get("key_file", DEFAULT_ZAI_ENV_FILE)).expanduser()
+    if f.exists() and f.stat().st_mode & 0o077:
+        print(f"glm key:     WARNING {f} is readable by others -> chmod 600 {f}")
+    url = a.get("base_url", ZAI_BASE_URL)
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=10)
+        print(f"glm url:     reachable {url}")
+    except urllib.error.HTTPError as e:   # any HTTP answer means the endpoint is reachable
+        print(f"glm url:     reachable {url} (HTTP {e.code} without auth, expected)")
+    except Exception as e:
+        print(f"glm url:     UNREACHABLE {url}: {type(e).__name__}: {e}")
+        good = False
+    if key:
+        # Direct API probe (1 output token): shows Z.ai's own status/code without Claude Code.
+        body = json.dumps({"model": a.get("model") or GLM_DEFAULT_MODEL, "max_tokens": 1,
+                           "messages": [{"role": "user", "content": "ping"}]}).encode()
+        req = urllib.request.Request(url.rstrip("/") + "/v1/messages", data=body, method="POST", headers={
+            "Authorization": f"Bearer {key}", "anthropic-version": "2023-06-01", "content-type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=60)
+            print("glm api:     ok (HTTP 200, key accepted)")
+        except urllib.error.HTTPError as e:
+            msg = redact(e.read().decode(errors="replace")[:300], key)
+            print(f"glm api:     FAILED HTTP {e.code}: {msg}")
+            good = False
+        except Exception as e:
+            print(f"glm api:     FAILED {type(e).__name__}: {e}")
+            good = False
+    claude_bin = a.get("bin", "claude")
+    if key and shutil.which(claude_bin):
+        env = glm_env(a, dict(os.environ))
+        cmd = [claude_bin, "-p", "Reply with exactly the word pong.", "--output-format", "stream-json",
+               "--verbose", "--max-turns", "1", "--tools", "", "--no-session-persistence"]
+        with tempfile.TemporaryFile("w+") as fh:
+            pr = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                  text=True, env=env, start_new_session=True)
+            deadline, why = time.time() + 180, None
+            while pr.poll() is None:
+                fh.seek(0)
+                why = api_retry_stop(fh.read(), min_attempt=2)
+                if why or time.time() > deadline:
+                    os.killpg(pr.pid, signal.SIGKILL)
+                    pr.wait()
+                    why = why or "timeout 180 s"
+                    break
+                time.sleep(1)
+            fh.seek(0)
+            out = redact(fh.read(), key)
+        res = next((json.loads(l) for l in reversed(out.splitlines()) if l.startswith('{"type":"result"')), {})
+        if not why and pr.returncode == 0 and not res.get("is_error") and "pong" in str(res.get("result", "")).lower():
+            print(f"glm ping:    ok via Claude Code, model {env['ANTHROPIC_MODEL']} ({res.get('duration_ms', '?')} ms)")
+        else:
+            reason = {"auth": "Z.ai rejected the key (401/403)", "limit": "Z.ai returned 429 (limit)"}.get(why, why)
+            print(f"glm ping:    FAILED ({reason or 'rc=' + str(pr.returncode)}): {tail(out, 3)[:500]}")
+            good = False
+    elif key:
+        print(f"glm ping:    skipped ({claude_bin} not on PATH)")
+    else:
+        print("glm ping:    skipped (no key)")
+    return good or not used
+
+
+def doctor_grok(root):
+    """grok checks for `forge doctor`: binary, version, login state (via `grok models`, which
+    makes no model call). Returns False only when this project's forge.toml uses grok."""
+    try:
+        cfg = tomllib.loads((root / "forge.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        cfg = {}
+    ag = cfg.get("agents", {})
+    a = ag.get("grok", {})
+    used = "grok" in (list(ag.get("workers", [])) + list(ag.get("review_pool", []) or [])
+                      + [ag.get("planner"), ag.get("auditor"), ag.get("reviewer")])
+    note = "" if used else "  [grok not used by this project]"
+    b = shutil.which(a.get("bin", "grok"))
+    if not b:
+        print(f"grok:        not installed (AUR grok-build-bin){note}")
+        return not used
+    v = sh([b, "--version"], check=False, timeout=30)
+    print(f"grok:        {b} {(v.stdout or '').strip()}{note}")
+    try:
+        m = sh([b, "models"], check=False, timeout=60)
+        out = (m.stdout or "") + (m.stderr or "")
+    except subprocess.TimeoutExpired:
+        out = "timeout"
+    authed = m.returncode == 0 and not GROK_AUTH_RE.search(out) if out != "timeout" else False
+    if not authed and os.environ.get("XAI_API_KEY"):
+        print("grok auth:   XAI_API_KEY set in environment (not printed)")
+        authed = True
+    print(f"grok auth:   {'logged in' if authed else 'NOT logged in -> run `grok login` (or `grok login --device-code`)'}")
+    dm = re.search(r"Default model:\s*(\S+)", out)
+    if dm:
+        print(f"grok model:  {a.get('model') or dm.group(1)}" + ("" if a.get("model") else " (CLI default)"))
+    return authed or not used
+
+
+def doctor_opencode(root):
+    """opencode checks for `forge doctor`, one line per [agents.<name>] table with
+    harness = "opencode": binary, model set, bubblewrap present (unless sandbox = "none") and
+    `opencode auth list` output (no model call). Fails doctor only when such vendors exist."""
+    try:
+        cfg = tomllib.loads((root / "forge.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        cfg = {}
+    tables = {k: v for k, v in (cfg.get("agents") or {}).items()
+              if isinstance(v, dict) and v.get("harness") == "opencode"}
+    good, authed = True, None
+    for name, a in tables.items():
+        b = shutil.which(a.get("bin", "opencode"))
+        problems = []
+        if not b:
+            problems.append("opencode not installed (npm i -g opencode-ai, or AUR opencode-bin)")
+        if not a.get("model"):
+            problems.append('no model (e.g. model = "opencode-go/kimi-k3")')
+        if a.get("sandbox", "bwrap") != "none" and not shutil.which(a.get("bwrap", "bwrap")):
+            problems.append("bubblewrap missing (package `bubblewrap`)")
+        if b and authed is None:
+            try:
+                r = sh([b, "auth", "list"], check=False, timeout=60)
+                authed = r.returncode == 0 and bool((r.stdout or "").strip())
+            except subprocess.TimeoutExpired:
+                authed = False
+        print(f"opencode:    {name:10} {a.get('model', '?')}  "
+              + ("; ".join(problems) if problems else "ok") + f"  family {family_of(_Cfg(cfg), name)}")
+        good &= not problems
+    if tables and authed is False:
+        print("opencode auth: no saved credentials -> run `opencode auth login` (OpenCode Go: paste the console key)")
+        good = False
+    return good
+
+
+class _Cfg:
+    """Tiny stand-in for Project where only .c() is needed (doctor runs without a Project)."""
+    def __init__(self, cfg):
+        self.cfg, self.mock = cfg, False
+    c = Project.c
+
+
+def cmd_up(proj, args):
+    """tmux layout: orchestrator | status | event log."""
+    sess = f"forge-{proj.root.name}"
+    me = shlex.quote(str(Path(__file__).resolve()))
+    root = shlex.quote(str(proj.root))
+    mock = "FORGE_MOCK=1 " if proj.mock else ""
+    wait = " --wait" if args.wait else ""
+    run = f"{mock}{me} -C {root} run --parallel {args.parallel}{wait}; echo '[run finished - press enter]'; read"
+    status = f"watch -n 5 -t {me} -C {root} status"
+    events = f"touch {root}/.forge/logs/events.log; tail -n 50 -F {root}/.forge/logs/events.log"
+    if sh(["tmux", "has-session", "-t", sess], check=False).returncode == 0:
+        die(f"tmux session {sess} exists; attach with `tmux attach -t {sess}`")
+    sh(["tmux", "new-session", "-d", "-s", sess, "-n", "forge", "-c", str(proj.root), run])
+    sh(["tmux", "split-window", "-h", "-t", f"{sess}:forge", "-c", str(proj.root), status])
+    sh(["tmux", "split-window", "-v", "-t", f"{sess}:forge.1", "-c", str(proj.root), events])
+    sh(["tmux", "new-window", "-t", sess, "-n", "shell", "-c", str(proj.root)])
+    sh(["tmux", "select-window", "-t", f"{sess}:forge"])
+    print(f"started tmux session {sess}")
+    if not args.detach and sys.stdout.isatty():
+        os.execvp("tmux", ["tmux", "attach", "-t", sess])
+
+
+def cmd_gates(proj, args):
+    """Run gates on the main checkout against a base ref (for CI / humans)."""
+    fake = {"id": "manual", "owns": ["**"], "docs": [], "tests_required": False, "may_edit_tests": True}
+    ok, rep = run_gates(proj, proj.root, args.base, fake)
+    print(rep)
+    sys.exit(0 if ok else 1)
+
+
+def build_parser():
+    """Build the CLI parser. Kept separate so tests/check_docs.py can diff it against docs/CLI.md."""
+    ap = argparse.ArgumentParser(prog="forge", description=__doc__)
+    ap.add_argument("-C", dest="root", default=".", help="project root (default .)")
+    ap.add_argument("--mock", action="store_true", help="use mock agents (no tokens spent)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("init", help="create a project from the template")
+    p.add_argument("dir"); p.add_argument("--preset", default="godot-csharp"); p.add_argument("--spec")
+    p.add_argument("--no-sample", action="store_true", help="omit the preset's disposable sample code (.forge-samples)")
+    p = sub.add_parser("plan", help="decompose the spec into task cards")
+    p.add_argument("--spec"); p.add_argument("--milestone"); p.add_argument("--agent", help="vendor: claude, codex, glm, grok or an [agents.<name>] opencode vendor")
+    p = sub.add_parser("run", help="execute ready tasks in parallel worktrees")
+    p.add_argument("--parallel", "-j", type=int, default=2)
+    p.add_argument("--task", nargs="*"); p.add_argument("--audit", action="store_true", help="audit when done")
+    p.add_argument("--wait", action="store_true", help="when only cooling vendors block cards, sleep until one is free")
+    p = sub.add_parser("up", help="run inside a tmux dashboard")
+    p.add_argument("--parallel", "-j", type=int, default=2); p.add_argument("--detach", "-d", action="store_true")
+    p.add_argument("--wait", action="store_true", help="passed to run")
+    sub.add_parser("status", help="show task table")
+    p = sub.add_parser("limits", help="show per-vendor cooldowns and allowance use")
+    p.add_argument("--clear", nargs="*", metavar="VENDOR", help="lift cooldowns (all, or the named vendors)")
+    p = sub.add_parser("review", help="re-run gates (+reviewer) on a task worktree")
+    p.add_argument("task"); p.add_argument("--agent", help="vendor: claude, codex, glm, grok or an [agents.<name>] opencode vendor"); p.add_argument("--gates-only", action="store_true")
+    p = sub.add_parser("audit", help="whole-repo audit by the monitor agent; may add FIX cards")
+    p.add_argument("--agent", help="vendor: claude, codex, glm, grok or an [agents.<name>] opencode vendor")
+    p = sub.add_parser("reset", help="put blocked tasks back to todo")
+    p.add_argument("task", nargs="+"); p.add_argument("--hard", action="store_true", help="also discard worktree")
+    p = sub.add_parser("gates", help="run gates on main vs a base ref")
+    p.add_argument("--base", default="HEAD~1")
+    sub.add_parser("doctor", help="check tools and CLI auth")
+    sub.add_parser("sync-agents", help="regenerate AGENTS.md policy lists from forge.toml [policy]")
+    p = sub.add_parser("regate", help="gates + review + merge on the existing task branch (no worker)")
+    p.add_argument("task", nargs="+")
+    p.add_argument("--continue", dest="cont", action="store_true", help="on failure, let workers retry")
+    p = sub.add_parser("upgrade", help="add newer forge files (.forge-samples, policy lists) to a project")
+    p.add_argument("--preset", default="godot-csharp")
+    return ap
+
+
+def main():
+    """Entry point: parse args, set mock mode, dispatch to cmd_* handlers."""
+    args = build_parser().parse_args()
+    if args.mock:
+        os.environ["FORGE_MOCK"] = "1"
+    if args.cmd == "init":
+        return cmd_init(args)
+    if args.cmd == "doctor":
+        return cmd_doctor(args)
+    proj = Project(Path(args.root))
+    {"plan": cmd_plan, "run": cmd_run, "up": cmd_up, "status": cmd_status, "review": cmd_review,
+     "audit": cmd_audit, "reset": cmd_reset, "gates": cmd_gates, "sync-agents": cmd_sync_agents,
+     "regate": cmd_regate, "upgrade": cmd_upgrade, "limits": cmd_limits}[args.cmd](proj, args)
+
+
+if __name__ == "__main__":
+    main()
