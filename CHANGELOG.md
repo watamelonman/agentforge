@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+- LIMITS: say that a shared-pool window set to `0` (or left out) is off, matching the code
+  and CONFIG.
+
 ## v0.1.0 (2026-10-26)
 First public release.
 

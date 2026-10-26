@@ -92,6 +92,10 @@ usd_7d = 5.50
 usd_30d = 11.0
 ```
 
+Each window is optional: leave a key out, or set it to `0`, to turn that window off (for
+example `usd_7d = 0` and `usd_30d = 0` keep only the 5-hour cap and let the provider's own
+limit message stop the pool). A provider limit message still cools the whole pool either way.
+
 - Every pooled run appends `{"kind": "spend", "usd", "vendor", "project", "t"}` to
   `~/.local/state/agentforge/pools/<name>.jsonl` (`$XDG_STATE_HOME` or `$FORGE_POOL_DIR`
   override the directory) under an exclusive `flock`, so runs in every repo see each other.
