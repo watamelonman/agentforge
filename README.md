@@ -86,5 +86,5 @@ end-to-end run with mock agents. No tokens are spent.
 ## Status and license
 Version 0.1.0, see [CHANGELOG](CHANGELOG.md). Agents run with write access to their worktree
 and use your paid CLI subscriptions or API keys; read [GATES](docs/GATES.md) and
-[VENDORS](docs/VENDORS.md) before running unattended. Licensed under the MIT License, see
+[VENDORS](docs/VENDORS.md) before running unattended. Licensed under the GNU Affero General Public License v3.0 only (AGPL-3.0-only), see
 [LICENSE](LICENSE).
