@@ -49,6 +49,12 @@ if ((AGENTS)); then
   fi
 fi
 
+# forge = bin/forge (thin entry point) + the agentforge/ package beside it. The symlink keeps
+# both in this checkout: bin/forge resolves its own path and imports ../agentforge, so a
+# `git pull` here updates the installed forge. Never copy bin/forge on its own.
+if [[ ! -f "$here/agentforge/__init__.py" ]]; then
+  echo "agentforge/ package missing next to bin/forge in $here; re-clone the repo"; exit 1
+fi
 ln -sf "$here/bin/forge" "$HOME/.local/bin/forge"
 mkdir -p "$HOME/.config/systemd/user"
 cp "$here/systemd/forge-run@.service" "$HOME/.config/systemd/user/"

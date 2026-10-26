@@ -5,8 +5,8 @@ Checks:
 1. Every subcommand of the real argparse parser has a `### forge <cmd>` section in docs/CLI.md,
    every option string of that subcommand appears in its section, and every `--flag` written
    in a section exists in the parser (both directions).
-2. Every forge.toml key that bin/forge reads (proj.c(...), P.get, L.get, a.get) and every key
-   in every preset forge.toml appears in docs/CONFIG.md as `section.key`.
+2. Every forge.toml key that bin/forge and the agentforge/ package read (proj.c(...), P.get,
+   L.get, a.get) and every key in every preset forge.toml appears in docs/CONFIG.md as `section.key`.
 3. Every preset folder is listed in docs/PRESETS.md and in the --preset line of docs/CLI.md.
 """
 import argparse
@@ -59,7 +59,8 @@ for doc_cmd in sections:
 
 # ---- 2. CONFIG
 conf = (ROOT / "docs" / "CONFIG.md").read_text()
-src = (ROOT / "bin" / "forge").read_text()
+# bin/forge is a thin entry point; the code (and so the key reads) lives in agentforge/.
+src = "\n".join(f.read_text() for f in [ROOT / "bin" / "forge", *sorted((ROOT / "agentforge").rglob("*.py"))])
 keys = set()
 for chain in re.findall(r'\.c\(((?:"[a-z_]+",\s*|vendor,\s*)+(?:"[a-z_]+")?)', src):
     parts = [x.strip().strip('"') for x in chain.split(",") if x.strip()]

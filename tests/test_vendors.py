@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 forge = SourceFileLoader("forge", str(ROOT / "bin" / "forge")).load_module()
+import agentforge.pools as pools  # noqa: E402  (bin/forge put ROOT on sys.path) POOL_DIR is read there
 
 
 class P:
@@ -506,7 +507,7 @@ class PoolP(P):
 
 
 def _pool_writer(path_dir, n):
-    forge.POOL_DIR = Path(path_dir)
+    pools.POOL_DIR = Path(path_dir)
     for i in range(n):
         forge.pool_append("go", {"kind": "spend", "usd": 0.01, "vendor": "w", "project": str(i)})
 
@@ -516,12 +517,12 @@ class Pools(unittest.TestCase):
     def setUp(self):
         reset_limits()
         self.td = tempfile.TemporaryDirectory()
-        self.old_dir = forge.POOL_DIR
-        forge.POOL_DIR = Path(self.td.name)
+        self.old_dir = pools.POOL_DIR
+        pools.POOL_DIR = Path(self.td.name)
         forge.POOL_CACHE.clear()
 
     def tearDown(self):
-        forge.POOL_DIR = self.old_dir
+        pools.POOL_DIR = self.old_dir
         forge.POOL_CACHE.clear()
         self.td.cleanup()
 
@@ -539,7 +540,7 @@ class Pools(unittest.TestCase):
         self.assertIsNone(forge.pool_of(p, "claude"))
         self.assertEqual(forge.pool_until(p, "oc-free"), 0)
         forge.record_pool_spend(p, "oc-free", 99.0)
-        self.assertFalse((forge.POOL_DIR / "go.jsonl").exists())
+        self.assertFalse((pools.POOL_DIR / "go.jsonl").exists())
         self.assertTrue(forge.available(p, "oc-free"))
 
     def test_spend_shared_across_vendors_and_projects(self):
@@ -619,7 +620,7 @@ class Pools(unittest.TestCase):
             pr.start()
         for pr in procs:
             pr.join()
-        with open(forge.POOL_DIR / "go.jsonl", "a") as fh:
+        with open(pools.POOL_DIR / "go.jsonl", "a") as fh:
             fh.write('{"kind": "spend", "usd": 9\n')          # torn line from a crash
         self.assertEqual(len(forge.pool_spend("go")), 200)
         self.assertAlmostEqual(sum(c for _, c in forge.pool_spend("go")), 2.0, places=6)
