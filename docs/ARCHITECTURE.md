@@ -1,6 +1,7 @@
 # Architecture and data flow
 
-AgentForge is one stdlib-only Python program (`bin/forge`) plus a project template. It
+AgentForge is one stdlib-only Python program (`bin/forge`, a thin entry point over the
+`agentforge/` package) plus a project template. It
 doesn't run a server or a database. All state lives in the project's git repo and in its
 `.forge/` folder.
 
@@ -25,7 +26,9 @@ flowchart TD
     R -. usage limit: next reviewer, or park until one is free .-> R
 ```
 
-## Components (all in `bin/forge`)
+## Components
+Which module holds each function: see [Module map](#module-map) below.
+
 | Part | Functions | Role |
 |---|---|---|
 | Project/config/state | `Project`, `update_state`, `set_task`, `event` | Loads `forge.toml` and keeps `.forge/state.json`, guarded by a thread lock and atomic rename. Appends to `.forge/logs/events.log`. |
@@ -39,6 +42,40 @@ flowchart TD
 | Gates | `gate_policy`, `doc_coverage`, `gd_untyped`, `gate_layers`, `run_gates` | Built-in checks first (anti-cheat, scope, size, docs, typing, architecture layers), then the engine's commands from `[gates.cmd]`. |
 | Orchestration | `run_task`, `can_start`, `ready_tasks`, `overlaps`, `cmd_run` | Thread pool scheduler plus the per-task loop: work, gates, review, merge; limit handovers, parking (`pending_review`) and `--wait`. |
 | Git | `ensure_worktree`, `commit_all`, `sync_main` | Worktree per task under `.forge/worktrees/<ID>` on branch `forge/<ID>`. |
+
+## Module map
+`bin/forge` only puts the checkout on `sys.path` and calls `agentforge.cli.main()`. It finds
+the package relative to its own resolved path, so the `~/.local/bin/forge` symlink works; a
+copy of `bin/forge` without `agentforge/` next to it does not. `agentforge/__init__.py`
+re-exports every public name, so tests can load `bin/forge` and use `forge.<name>`.
+
+Dependencies point downwards in this list (a module imports only modules above it).
+
+| Module | Holds |
+|---|---|
+| `util.py` | Install paths (`FORGE_HOME`, `TEMPLATE`, `FORGE_SCRIPT`), `sh`/`git`/`die`, `glob_match`, `fmt_time`, `render`. |
+| `project.py` | `Project` (forge.toml, `.forge/` layout, `state.json`, events), `ConfigView`, `STATE_LOCK`/`MERGE_LOCK`/`STOP`. |
+| `cards.py` | `load_cards`, `write_card`. |
+| `vendors.py` | `VENDORS`, `HARNESS`, `FAMILY`, `vendor_names`, `harness_of`, `family_of`, `check_vendor`, `used_vendors`. |
+| `glm.py` | `glm_key`, `glm_env`, `read_env_file`, `redact`. |
+| `parsers/` | One reader per CLI output: `claude.py` (result line, `rate_limit_events`, `api_retry_stop`), `codex.py`, `grok.py` (`parse_grok_output`), `opencode.py` (`parse_opencode_output`), `jsonblob.py` (`parse_json_blob`). |
+| `pools.py` | Shared pool ledgers: `pool_of`, `pool_append`, `pool_entries`, `pool_spend`, `pool_until`, `pool_use`. |
+| `limits.py` | Cooldowns, disables, allowances, spend: `set_cooldown`, `cooldown_until`, `available`, `allowance_until`, `record_spend`, `next_wakeup`. |
+| `resettime.py` | `DURATION_RE`, `RESET_IN_RE`, `RESET_AT_RE`, `duration_secs`, `parse_when`, `limit_reset_time`. |
+| `detect.py` | `detect_limit` and the limit/auth regexes (`LIMIT_RE`, `ZAI_LIMIT_RE`, `GROK_*`, `OPENCODE_*`). |
+| `harness/` | `build_cmd` (in `__init__.py`) dispatching to `claude.py`, `codex.py`, `grok.py`, `opencode.py`; `sandbox.py` (`sandbox_wrap`, bubblewrap). |
+| `process.py` | `run_supervised`: start the CLI in its own process group, stream its log, enforce the timeout, kill on paid overage or endless API retries. |
+| `runner.py` | `run_agent` and its steps: refusal checks, env, argv, prompt, supervised run, output parsing, spend accounting, limit handling. |
+| `gates/` | `run_gates` (in `__init__.py`); `policy.py` (`gate_policy`), `doccheck.py` (`doc_coverage`, `gd_untyped`), `layers.py` (`gate_layers`), `diff.py` (changed files and lines). |
+| `choice.py` | `pick_worker`, `review_pool`, `review_candidates`, `cross_reviewer`, `pick_reviewer`, `WAIT`. |
+| `gitops.py` | `ensure_worktree`, `commit_all`, `sync_main`, `restore_deps`, `branch_author`. |
+| `context.py` | `build_context`, `select_spec_sections`, `md_sections`, `with_context`. |
+| `task.py` | `run_task`: one card's attempts, handovers, gates, review and merge (`TaskRun`). |
+| `policy_lists.py` | `render_policy_lists` (AGENTS.md lists, `.claude` deny rules). |
+| `commands/` | `setup.py` (init, upgrade, sync-agents), `agents.py` (plan, review, audit, reset, regate), `info.py` (status, limits, gates, up). |
+| `scheduler.py` | `cmd_run`: pre-flight, `ready_tasks`/`can_start`/`overlaps`, the thread-pool loop, `--wait`. |
+| `doctor.py` | `cmd_doctor`, `doctor_glm`, `doctor_grok`, `doctor_opencode`. |
+| `cli.py` | `build_parser`, `main`. |
 
 ## Design rules this enforces
 - **Isolation:** parallel agents never share a checkout. The scheduler also refuses to run two

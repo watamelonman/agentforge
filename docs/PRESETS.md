@@ -2,7 +2,7 @@
 
 A preset is a folder under `template/presets/<name>/` that `forge init` copies over
 `template/common/`. The engine adapter is just data: `forge.toml` sections `[gates]`,
-`[layers]`, `[policy]` plus whatever tools/scripts the gates call. `bin/forge` has no
+`[layers]`, `[policy]` plus whatever tools/scripts the gates call. forge has no
 engine-specific code apart from the GDScript typing/doc heuristics.
 
 | Preset | Status | Notes |

@@ -23,7 +23,8 @@ What it does, in order:
 4. Agents, only if missing: Claude Code through the official native installer
    (`curl -fsSL https://claude.ai/install.sh | bash`); Codex with
    `npm install -g @openai/codex` using an npm prefix of `~/.local` (no sudo).
-5. Symlinks `~/.local/bin/forge` and installs `~/.config/systemd/user/forge-run@.service`.
+5. Symlinks `~/.local/bin/forge` to the checkout's `bin/forge` (which imports the `agentforge/`
+   package next to it, so keep the checkout in place) and installs `~/.config/systemd/user/forge-run@.service`.
 6. Runs `forge doctor`, which only reports login status. **The installer never reads, writes,
    or asks for API keys or tokens.** Log in yourself with `claude auth login` and `codex login`
    (add `--device-auth` on a machine without a browser).

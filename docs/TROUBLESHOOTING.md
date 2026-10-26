@@ -31,7 +31,7 @@ every remaining card needs a vendor that is cooling down, `forge run` exits and 
 next vendor is free; `forge run --wait` sleeps until then instead. Nothing needs `forge reset`.
 Full rules: [LIMITS](LIMITS.md).
 
-The same handling covers (see `detect_limit` in `bin/forge`):
+The same handling covers (see `detect_limit` in `agentforge/detect.py`):
 - Claude Code's stream-json `rate_limit_event` with `status: "rejected"` (claude and glm);
 - glm: `API Error: 429` or a Z.ai limit code in the error body (1113, 1302, 1305, 1308, 1309,
   1310, 1313, 1316-1321). The log line reads `USAGE LIMIT hit (Z.ai quota/rate limit ...)`;

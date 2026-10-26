@@ -1,7 +1,7 @@
 # forge.toml reference
 
 `forge.toml` lives in the project root. Agents can't change it: it's in `[policy] protected`
-and in the Claude deny rules. Defaults below are the values `bin/forge` uses when a key is
+and in the Claude deny rules. Defaults below are the values forge uses when a key is
 **missing**. The preset files set many keys explicitly. `tests/check_docs.py` fails if code
 reads a key that isn't listed here.
 
@@ -31,7 +31,7 @@ reads a key that isn't listed here.
 | `agents.self_review_fallback` | bool | `false` | With `reviewer = "cross"`: when every other reviewer candidate is cooling down, let the author's own vendor review rather than park the card. Off by default, because self-review is weaker. |
 | `agents.swap_on_retry` | bool | `true` | From attempt 3 on, rotate to a different vendor in `workers` (if it has more than one): attempt 3 goes to the first other vendor in list order, attempt 4 to the next, and so on. With two vendors that is the old plain swap. |
 
-How `reviewer = "cross"` chooses (`review_candidates()` and `cross_reviewer()` in `bin/forge`):
+How `reviewer = "cross"` chooses (`review_candidates()` and `cross_reviewer()` in `agentforge/choice.py`):
 
 1. Take `review_pool` (or `workers`), drop the author vendor and unknown names.
 2. Rank what is left by distance from the author, keeping list order inside each rank:

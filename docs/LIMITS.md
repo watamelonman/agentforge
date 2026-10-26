@@ -2,9 +2,10 @@
 
 Subscriptions and coding plans cap usage per 5 hours, per week or per month. forge treats a
 limit as a property of **one vendor**, not of the run: the vendor that hit it pauses, and the
-others keep working. The code lives in the "usage limits" section of `bin/forge`
-(`set_cooldown`, `cooldown_until`, `available`, `limit_reset_time`, `allowance_until`) and in
-`run_task` / `cmd_run`.
+others keep working. The code lives in `agentforge/limits.py`
+(`set_cooldown`, `cooldown_until`, `available`, `allowance_until`), `agentforge/resettime.py`
+(`limit_reset_time`), `agentforge/detect.py` (`detect_limit`) and in `run_task`
+(`agentforge/task.py`) / `cmd_run` (`agentforge/scheduler.py`).
 
 ## What happens when a vendor hits a limit
 1. `run_agent` sees the limit (`detect_limit`: the vendor's limit messages, Claude Code

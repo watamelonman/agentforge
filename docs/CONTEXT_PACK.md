@@ -25,7 +25,7 @@ early is paid for again on every later turn. Measured on one real Godot C# proje
 These numbers are upper bounds. The log scan counts `sed -n` ranges as whole-file reads.
 
 ## What goes in
-`build_context()` in `bin/forge` assembles these parts, in this order:
+`build_context()` in `agentforge/context.py` assembles these parts, in this order:
 
 1. **Spec sections** from `[project] spec`:
    - every section whose heading number the card cites as `§N` or `§N.M`;

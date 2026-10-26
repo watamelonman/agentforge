@@ -36,8 +36,8 @@ are plain shell commands, so any project with a build/lint/test command can use 
 - **Context packs**: each prompt carries only the card, the relevant spec sections and owned
   files, within `context.max_chars`. See [CONTEXT_PACK](docs/CONTEXT_PACK.md).
 - **Presets**: Godot 4 C# (default), Godot 4 typed GDScript, C/raylib, Python, LÖVE, Ren'Py.
-- One stdlib Python file (`bin/forge`), no services or databases; state is a JSON file in the
-  project. A tmux dashboard (`forge up`) and a systemd user unit for unattended runs.
+- Stdlib-only Python (`bin/forge` plus the `agentforge/` package beside it), no services or
+  databases; state is a JSON file in the project. A tmux dashboard (`forge up`) and a systemd user unit for unattended runs.
 
 ## Requirements
 - Linux (the installer supports Arch and Fedora; other distros work with manual installs)
@@ -56,7 +56,8 @@ forge doctor                        # tools and logins (reads no secrets)
 ```
 `install.sh` installs system packages, gdtoolkit, Claude Code and Codex if missing, symlinks
 `bin/forge` to `~/.local/bin/forge` and installs the `forge-run@.service` user unit. Manual
-install: put `bin/forge` on your `PATH`. Details: [INSTALL](docs/INSTALL.md).
+install: symlink `bin/forge` onto your `PATH` (it imports `agentforge/` from the checkout, so
+don't copy the file on its own). Details: [INSTALL](docs/INSTALL.md).
 
 ## Quickstart
 ```bash

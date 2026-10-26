@@ -10,7 +10,7 @@ A **vendor** is a coding model plus the CLI forge launches it with. A **harness*
 | `grok` | Grok Build | `grok --prompt-file ... --output-format streaming-messages-json` | `grok login` (your own SuperGrok/X plan) or `XAI_API_KEY` | `grok_usd_reported` when xAI reports it (usually absent on subscription logins); not counted in the budget |
 | any `[agents.<name>]` with `harness = "opencode"` | OpenCode | `opencode run --standalone --format json -m <provider/model> ...` inside bubblewrap | `opencode auth login` (OpenCode Go key, ChatGPT login, any provider OpenCode supports) | `vendor_usd.<name>` (OpenCode's API-price figure); not counted in the budget |
 
-The built-in vendors live in `VENDORS`, `HARNESS` and `FAMILY` at the top of `bin/forge`;
+The built-in vendors live in `VENDORS`, `HARNESS` and `FAMILY` in `agentforge/vendors.py`;
 OpenCode vendors come from `forge.toml` (`vendor_names()`).
 
 ## How vendors are chosen
@@ -124,7 +124,7 @@ file in the worktree can be read by the agent.
 `grok` runs xAI's own coding CLI (Arch: AUR `grok-build-bin`, binary `/usr/bin/grok`) headless.
 Use your own Grok plan or an API key in your name; a shared account breaks xAI's terms.
 
-### Argv (`grok_cmd` in `bin/forge`)
+### Argv (`grok_cmd` in `agentforge/harness/grok.py`)
 - Always: `--prompt-file <log>.prompt.md` (the prompt forge already logs, so no argv size
   limit), `--cwd <worktree>`, `--no-alt-screen`, `--max-turns`, optional `-m`/`--reasoning-effort`.
 - work: `--sandbox workspace --always-approve --output-format streaming-messages-json`, plus
@@ -186,7 +186,7 @@ The allowance figures above are an example (OpenCode Go Plus as of October 2026,
 third-party summary); check opencode.ai for your plan. The model ids are illustrative too;
 use what `opencode models` prints.
 
-### Argv (`opencode_cmd` in `bin/forge`)
+### Argv (`opencode_cmd` in `agentforge/harness/opencode.py`)
 `opencode run --standalone --format json -m <model>[#<variant>] [--auto] [extra_args...] <prompt>`
 - OpenCode 2.x has no `--dir` or `--variant`: the working directory is the process cwd
   (bubblewrap `--chdir` to the worktree), and `variant` rides on the model id as `#<variant>`.
@@ -282,13 +282,15 @@ claude-only: glm and codex never set this field.
 ## Adding another vendor
 More models through OpenCode need no code: add an `[agents.<name>]` table (see above).
 A new **CLI** needs code:
-1. Add the name to `VENDORS`, its CLI to `HARNESS` and its lab to `FAMILY` in `bin/forge`.
-2. Add its argv in `build_cmd` (`role != "work"` must be read-only) and, if it needs a special
-   environment, an equivalent of `glm_env` applied in `run_agent`.
+1. Add the name to `VENDORS`, its CLI to `HARNESS` and its lab to `FAMILY` in `agentforge/vendors.py`.
+2. Add its argv in a new `agentforge/harness/<cli>.py`, dispatched from `build_cmd` in
+   `agentforge/harness/__init__.py` (`role != "work"` must be read-only) and, if it needs a
+   special environment, an equivalent of `glm_env` applied in `_agent_env` (`agentforge/runner.py`).
 3. If its output isn't Claude Code stream-json, make sure the final message lands in the
-   `.out` file (`-o`-style), or parse it in `run_agent`.
-4. Teach `detect_limit` its limit messages, and `run_agent`'s spend block whether its cost
-   counts toward `total_usd`.
+   `.out` file (`-o`-style), or add a reader in `agentforge/parsers/` and call it from
+   `_parse_output` in `agentforge/runner.py`.
+4. Teach `detect_limit` (`agentforge/detect.py`) its limit messages, and `_account_run`
+   (`agentforge/runner.py`) whether its cost counts toward `total_usd`.
 5. Add `[agents.<name>]` keys to `CONFIG.md` (tests/check_docs.py enforces this), the
    `--agent` text in `CLI.md`, the `agent` enums in `schemas/plan.json` and
    `schemas/audit.json`, and mock cases in `tests/`.
