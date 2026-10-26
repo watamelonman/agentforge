@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+- love2d preset: `policy.skip_markers` had a Lua pattern (`%-%-%s*it%(`) that is not a valid
+  Python regex, so the policy gate crashed on every love2d project. It is now `--\s*it\(`
+  (a commented-out busted `it(`). New `tests/test_presets.py` compiles every preset's regex
+  keys and runs the policy gate on a scratch love2d project.
+
 ### Changed
 - Split the single-file `bin/forge` into the `agentforge/` package (about 40 modules, none
   over 260 lines; map in ARCHITECTURE). `bin/forge` is now a thin entry point that imports the
